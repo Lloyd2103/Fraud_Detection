@@ -11,15 +11,17 @@ from pyspark.sql.types import (
     DateType
 )
 
-# Initialize Spark Session configured with Delta Lake
+# KHỞI TẠO SPARK
 spark = SparkSession.builder \
     .appName("FraudDetection_BronzeIngestion") \
-    .master("yarn") \
     .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
     .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
     .getOrCreate()
 
-# Transaction JSON schema definition
+# Tắt các log thừa để tránh nghẽn I/O đĩa cứng Master khi chạy streaming dài hạn
+spark.sparkContext.setLogLevel("WARN")
+
+# Định nghĩa cấu trúc Schema JSON
 schema = StructType([
     StructField("transaction_id", StringType(), False),
     StructField("source_account", StringType(), True),
@@ -37,7 +39,7 @@ schema = StructType([
     StructField("partition_date", DateType(), True)
 ])
 
-# Read stream from Kafka
+# Đọc luồng dữ liệu thời gian thực từ Kafka Broker
 kafka_df = spark.readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", "labsoe-17:9092") \
@@ -45,21 +47,23 @@ kafka_df = spark.readStream \
     .option("startingOffsets", "earliest") \
     .load()
 
-# Parse JSON payload
+# Giải mã gói tin JSON từ Kafka payload
 parsed_df = kafka_df.selectExpr("CAST(value AS STRING) as json_payload") \
     .select(from_json(col("json_payload"), schema).alias("data")) \
     .select("data.*")
 
-# Target HDFS paths
+# Xác định đường dẫn lưu trữ tập trung trên HDFS phân tán
 bronze_path = "hdfs://labsoe-17:9000/lakehouse/fraud_detection/bronze"
 checkpoint_path = "hdfs://labsoe-17:9000/lakehouse/fraud_detection/checkpoints/bronze_ingest"
 
-# Write stream to Delta Lake Bronze table partitioned by date
+# Ghi luồng dữ liệu liên tục vào tầng Bronze Delta Table phân vùng theo ngày
+# Thêm khoảng thời gian xử lý micro-batch (trigger) để kiểm soát RAM ổn định cho máy
 query = parsed_df.writeStream \
     .format("delta") \
     .outputMode("append") \
     .partitionBy("partition_date") \
     .option("checkpointLocation", checkpoint_path) \
+    .trigger(processingTime="5 seconds") \
     .start(bronze_path)
 
 query.awaitTermination()

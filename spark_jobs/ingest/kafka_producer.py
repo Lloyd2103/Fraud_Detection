@@ -6,7 +6,8 @@ from datetime import datetime, timedelta
 from kafka import KafkaProducer
 
 # Configuration
-KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
+# Đổi sang IP thật để máy Worker có thể giao tiếp kéo luồng dữ liệu phân tán
+KAFKA_BOOTSTRAP_SERVERS = "192.168.80.200:9092"
 TOPIC_NAME = "transactions"
 CSV_FILE_PATH = "/home/master/PS_20174392719_1491204439457_log.csv"
 
@@ -19,8 +20,7 @@ producer = KafkaProducer(
 )
 
 def stream_transactions():
-    print("Starting Kafka Producer...")
-    base_time = datetime.now()
+    print("Starting Advanced Kafka Producer (Watermark Simulation Mode)...")
 
     with open(CSV_FILE_PATH, mode="r") as file:
         reader = csv.DictReader(file)
@@ -30,7 +30,6 @@ def stream_transactions():
         for row in reader:
             step = int(row["step"])
 
-            # PaySim schema: step, type, amount, nameOrig, oldbalanceOrg, newbalanceOrig, nameDest, oldbalanceDest, newbalanceDest, isFraud, isFlaggedFraud
             record = {
                 "transaction_id": f"TX_{step}_{random.randint(100000, 999999)}",
                 "source_account": row["nameOrig"],
@@ -48,27 +47,41 @@ def stream_transactions():
             if step == current_step:
                 step_records.append(record)
             else:
-                # Flush previous step with simulated out-of-order latency
-                flush_step_records(step_records, base_time, current_step)
+                # Thực hiện xả dữ liệu step cũ
+                flush_step_records(step_records, current_step)
                 current_step = step
                 step_records = [record]
-                time.sleep(10)  # Each simulation step compresses into 10 real seconds
+                time.sleep(10)  # Nén 1 giờ mô phỏng thành 10 giây thực tế
 
-def flush_step_records(records, base_time, step):
+        # Đảm bảo xả nốt step cuối cùng khi kết thúc file
+        if step_records:
+            flush_step_records(step_records, current_step)
+
+def flush_step_records(records, step):
     now = datetime.now()
+    processed_records = []
+
+    # BƯỚC 1: Tạo độ trễ và nhãn thời gian cho từng bản ghi độc lập
     for record in records:
-        # Simulate out-of-order transaction timestamp up to 30 seconds
+        # Mô phỏng giao dịch bị trễ mạng/lệch thứ tự lên tới 30 giây theo yêu cầu bắt buộc
         delay_seconds = random.randint(0, 30)
         event_time = now - timedelta(seconds=delay_seconds)
         
         record["timestamp"] = event_time.strftime("%Y-%m-%d %H:%M:%S")
         record["received_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
         record["partition_date"] = event_time.strftime("%Y-%m-%d")
+        processed_records.append(record)
+    
+    # BƯỚC 2: RÀNG BUỘC PHẢI CÓ - Xáo trộn ngẫu nhiên vị trí các bản ghi (Physical Shuffle)
+    # Việc này ép các tin nhắn có Event Time muộn bị ghi xen kẽ vào Kafka Partition
+    random.shuffle(processed_records)
 
+    # BƯỚC 3: Bắn dữ liệu lộn xộn vào Kafka Broker
+    for record in processed_records:
         producer.send(TOPIC_NAME, value=record)
     
     producer.flush()
-    print(f"Pushed {len(records)} transactions for Step {step}")
+    print(f"Pushed {len(processed_records)} out-of-order transactions for Step {step}")
 
 if __name__ == "__main__":
     stream_transactions()
