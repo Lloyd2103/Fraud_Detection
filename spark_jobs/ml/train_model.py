@@ -1,7 +1,7 @@
 import os
 import sys
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, when, count, lit
+from pyspark.sql.functions import col, when, count, lit, row_number, coalesce
 from pyspark.sql.window import Window
 from pyspark.ml import Pipeline
 from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, StandardScaler

@@ -21,7 +21,10 @@ spark = SparkSession.builder \
     .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
     .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true") \
     .config("spark.sql.adaptive.enabled", "false") \
+    .config("spark.network.timeout", "600s") \
+    .config("spark.executor.heartbeatInterval", "60s") \
     .getOrCreate()
+
 
 # Giảm thiểu tối đa log rác ghi xuống ổ đĩa Master
 spark.sparkContext.setLogLevel("WARN")
@@ -53,6 +56,10 @@ kafka_stream_df = spark.readStream \
     .option("subscribe", "transactions") \
     .option("startingOffsets", "latest") \
     .option("failOnDataLoss", "false") \
+    .option("kafka.request.timeout.ms", "120000") \          
+    .option("kafka.session.timeout.ms", "60000") \         
+    .option("kafka.fetch.max.wait.ms", "10000") \           
+    .option("maxOffsetsPerTrigger", "50000") \              
     .load()
 
 # 4. Parse JSON Payload và CẤU HÌNH WATERMARK BẮT BUỘC
