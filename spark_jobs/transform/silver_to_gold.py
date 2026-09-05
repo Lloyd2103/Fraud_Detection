@@ -2,7 +2,6 @@ import sys
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, count, sum as spark_sum, round, avg
 
-# KHỞI TẠO SPARK STANDALONE CLEAN
 spark = SparkSession.builder \
     .appName("FraudDetection_SilverToGold_Analytics") \
     .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
@@ -11,13 +10,13 @@ spark = SparkSession.builder \
 
 spark.sparkContext.setLogLevel("WARN")
 
-silver_transactions_path = "hdfs://labsoe-17:9000/lakehouse/fraud_detection/silver/transactions"
-gold_summary_path = "hdfs://labsoe-17:9000/lakehouse/fraud_detection/gold/fraud_summary"
+silver_transactions_path = "hdfs:///lakehouse/fraud_detection/silver/transactions"
+gold_summary_path = "hdfs:///lakehouse/fraud_detection/gold/fraud_summary"
 
-print("Reading Silver Transactions for Web App Analytics...")
+print("Reading Silver Transactions layer...")
 transactions_df = spark.read.format("delta").load(silver_transactions_path)
 
-print("Generating Gold Fraud Summary Report for Web Dashboard...")
+print("Generating Gold Fraud Summary Report...")
 summary_df = transactions_df.groupBy("trans_type", "channel").agg(
     count("transaction_id").alias("total_transactions"),
     spark_sum("amount").alias("total_volume"),
@@ -29,7 +28,9 @@ print(f"Writing data to Gold Fraud Summary on HDFS: {gold_summary_path}")
 summary_df.write \
     .format("delta") \
     .mode("overwrite") \
+    .option("overwriteSchema", "true") \
     .save(gold_summary_path)
 
 print("Silver to Gold Analytics Transformation executed successfully.")
 spark.stop()
+

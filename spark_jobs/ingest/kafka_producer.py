@@ -5,10 +5,14 @@ import random
 from datetime import datetime, timedelta
 from kafka import KafkaProducer
 
-# Configuration
-KAFKA_BOOTSTRAP_SERVERS = "192.168.80.200:9092"
-TOPIC_NAME = "transactions"
-CSV_FILE_PATH = "/home/master/PS_20174392719_1491204439457_log.csv"
+import os
+
+# Configuration (Centralized Environment Variables)
+MASTER_IP = os.getenv("MASTER_IP", "192.168.80.200")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", f"{MASTER_IP}:9092")
+TOPIC_NAME = os.getenv("KAFKA_TOPIC", "transactions")
+CSV_FILE_PATH = os.getenv("CSV_FILE_PATH", "/home/master/PS_20174392719_1491204439457_log.csv")
+
 CHANNELS = ["ATM", "POS", "ONLINE", "APP"]
 BATCH_SIZE = 100  # Số record mỗi batch trước khi flush
 
@@ -34,18 +38,21 @@ def flush_step_records(records, step):
     # Bước 2: Xáo trộn thứ tự để mô phỏng dữ liệu đến lộn xộn
     random.shuffle(processed_records)
 
-    # Bước 3: Gửi dữ liệu theo batch để giảm burst
+    # Bước 3: Gửi dữ liệu phân tán đều qua 4 Partitions (0, 1, 2, 3)
+    NUM_PARTITIONS = 4
     count = 0
     for record in processed_records:
-        key = record["source_account"]  # Dùng làm partition key để phân tán
-        producer.send(TOPIC_NAME, key=key, value=record)
+        key = record["source_account"]
+        target_partition = count % NUM_PARTITIONS  # Phân tán tròn 4 Partitions
+        producer.send(TOPIC_NAME, key=key, value=record, partition=target_partition)
         count += 1
         if count % BATCH_SIZE == 0:
             producer.flush()
-            time.sleep(0.1)  # Giảm tải cho broker
+            time.sleep(0.05)  # Giảm tải cho broker
 
     producer.flush()  # Flush phần còn lại
-    print(f"Pushed {len(processed_records)} out-of-order transactions for Step {step}")
+    print(f"Pushed {len(processed_records)} out-of-order transactions evenly across 4 Partitions (Step {step})")
+
 
 def stream_transactions():
     print("Starting Advanced Kafka Producer (Watermark Simulation Mode)...")
@@ -77,11 +84,14 @@ def stream_transactions():
                 flush_step_records(step_records, current_step)
                 current_step = step
                 step_records = [record]
-                time.sleep(10)  # Mô phỏng thời gian giữa các step
+                time.sleep(10)  # Mô phỏng 1 giờ (Step) nén còn 10 giây thực theo đúng yêu cầu đề bài
+
 
         # Xử lý step cuối cùng
         if step_records:
             flush_step_records(step_records, current_step)
+
+
 
 if __name__ == "__main__":
     stream_transactions()

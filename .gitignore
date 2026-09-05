@@ -1,0 +1,43 @@
+# Environment & Configs
+.env
+.env.*
+!.env.example
+conf/airflow.cfg
+*.cfg
+
+# Python Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+**/venv/
+**/env/
+webapp/backend/venv/
+
+# Node / Frontend Dependencies & Build
+node_modules/
+**/node_modules/
+dist/
+build/
+.npm/
+
+# Python Bytecode, Cache & Testing
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Logs & Temp files
+*.log
+/tmp/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+

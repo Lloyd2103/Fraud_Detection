@@ -1,64 +1,151 @@
 import sys
+import math
+import bisect
+from datetime import datetime
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, avg, stddev, abs as spark_abs
+from pyspark.sql.functions import col, lit
+from delta.tables import DeltaTable
 
-print("--- INITIALIZING DATA DRIFT DETECTION ENGINE ---")
-
-# 1. Khởi tạo Spark Session Standalone
-spark = SparkSession.builder \
-    .appName("FraudDetection_DataDrift_Monitoring") \
-    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
-    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
-    .getOrCreate()
-
-spark.sparkContext.setLogLevel("WARN")
-
-# Định nghĩa đường dẫn 2 tập dữ liệu cần đối chiếu trên HDFS
-baseline_features_path = "hdfs://labsoe-17:9000/lakehouse/fraud_detection/features"
-new_transactions_path = "hdfs://labsoe-17:9000/lakehouse/fraud_detection/silver/transactions"
-
-try:
-    print("Reading Baseline Features (Historical Data used for training)...")
-    baseline_df = spark.read.format("delta").load(baseline_features_path)
+def calculate_psi_and_ks(baseline_vals, target_vals, num_bins=10):
+    """Compute Population Stability Index (PSI) and KS-Statistic efficiently in O(N log N)."""
+    if not baseline_vals or not target_vals:
+        return 0.0, 0.0
     
-    print("Reading Target Data (New incoming Silver transactions this week)...")
-    target_df = spark.read.format("delta").load(new_transactions_path)
+    n_base = len(baseline_vals)
+    n_target = len(target_vals)
     
-    # 2. Tính toán các chỉ số phân phối thống kê mô tả (Mean, StdDev) cho trường 'amount'
-    print("Computing distribution metrics for transaction amount...")
-    baseline_stats = baseline_df.select(avg("amount").alias("mean"), stddev("amount").alias("stddev")).collect()[0]
-    target_stats = target_df.select(avg("amount").alias("mean"), stddev("amount").alias("stddev")).collect()[0]
+    sorted_base = sorted(baseline_vals)
+    sorted_target = sorted(target_vals)
     
-    mean_baseline = baseline_stats["mean"] or 0.0
-    std_baseline = baseline_stats["stddev"] or 1.0
+    percentiles = [i / float(num_bins) for i in range(1, num_bins)]
+    bins = [-float('inf')]
+    for p in percentiles:
+        idx = min(int(p * n_base), n_base - 1)
+        bins.append(sorted_base[idx])
+    bins.append(float('inf'))
     
-    mean_target = target_stats["mean"] or 0.0
-    
-    # 3. Áp dụng thuật toán kiểm định độ dịch chuyển (Population Stability Index đơn giản hóa qua Z-Score)
-    drift_score = abs(mean_target - mean_baseline) / (std_baseline / (target_df.count() ** 0.5))
-    
-    # Ngưỡng chấp nhận dao động phân phối (Thường đặt là 2.0 hoặc 3.0 trong hệ thống giám sát)
-    DRIFT_THRESHOLD = 3.0
-    
-    print("=" * 60)
-    print(f"Baseline Mean Amount : {mean_baseline:.4f}")
-    print(f"Target Mean Amount   : {mean_target:.4f}")
-    print(f"Calculated Drift Score: {drift_score:.4f}")
-    print("=" * 60)
-    
-    if drift_score > DRIFT_THRESHOLD:
-        print("ALERT: Data Drift detected! The distribution of transaction amounts has changed significantly.")
-        print("Status: TRIGGER_RETRAIN")
-        # Thoát với mã code đặc biệt để Airflow biết đường rẽ nhánh kích hoạt job re-train
-        sys.exit(10)
+    bins = sorted(list(set(bins)))
+    if len(bins) < 2:
+        return 0.0, 0.0
+        
+    base_counts = [0] * (len(bins) - 1)
+    for v in baseline_vals:
+        for i in range(len(bins) - 1):
+            if bins[i] <= v < bins[i+1]:
+                base_counts[i] += 1
+                break
+                
+    target_counts = [0] * (len(bins) - 1)
+    for v in target_vals:
+        for i in range(len(bins) - 1):
+            if bins[i] <= v < bins[i+1]:
+                target_counts[i] += 1
+                break
+                
+    psi = 0.0
+    for b_c, t_c in zip(base_counts, target_counts):
+        b_pct = max(b_c / float(n_base), 0.0001)
+        t_pct = max(t_c / float(n_target), 0.0001)
+        psi += (t_pct - b_pct) * math.log(t_pct / b_pct)
+        
+    # Efficient O(N log N) KS-statistic calculation via bisect
+    all_vals = sorted(list(set(sorted_base + sorted_target)))
+    if len(all_vals) > 2000:
+        step = len(all_vals) // 2000
+        sampled_points = all_vals[::step]
     else:
-        print("SUCCESS: No significant Data Drift detected. Model behavior remains stable.")
-        print("Status: KEEP_CURRENT_MODEL")
-        sys.exit(0)
+        sampled_points = all_vals
 
-except Exception as e:
-    print(f"Error during drift detection pipeline: {str(e)}")
-    sys.exit(1)
-    
-finally:
-    spark.stop()
+    max_ks = 0.0
+    for val in sampled_points:
+        cdf_b = bisect.bisect_right(sorted_base, val) / float(n_base)
+        cdf_t = bisect.bisect_right(sorted_target, val) / float(n_target)
+        ks = abs(cdf_b - cdf_t)
+        if ks > max_ks:
+            max_ks = ks
+            
+    return float(psi), float(max_ks)
+
+def run_drift_monitoring():
+    print("--- INITIALIZING DATA DRIFT MONITORING ENGINE (PSI & KS STATISTIC) ---")
+
+    spark = SparkSession.builder \
+        .appName("FraudDetection_PSI_KS_Drift_Monitoring") \
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
+        .getOrCreate()
+
+    spark.sparkContext.setLogLevel("WARN")
+
+    baseline_features_path = "hdfs:///lakehouse/fraud_detection/features"
+    target_transactions_path = "hdfs:///lakehouse/fraud_detection/silver/transactions"
+    drift_gold_path = "hdfs:///lakehouse/fraud_detection/gold/drift_monitoring"
+
+    try:
+        print(f"Reading Baseline Features from {baseline_features_path}...")
+        baseline_df = spark.read.format("delta").load(baseline_features_path)
+        
+        print(f"Reading Target Transactions from {target_transactions_path}...")
+        target_df = spark.read.format("delta").load(target_transactions_path)
+        
+        features_to_check = ["amount", "old_balance_source", "trans_count_total"]
+        results = []
+        max_overall_psi = 0.0
+        
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        
+        for f in features_to_check:
+            if f in baseline_df.columns and f in target_df.columns:
+                print(f"Computing PSI & KS for feature: {f}...")
+                base_vals = [r[0] for r in baseline_df.select(f).dropna().limit(10000).collect() if r[0] is not None]
+                targ_vals = [r[0] for r in target_df.select(f).dropna().limit(10000).collect() if r[0] is not None]
+                
+                psi, ks = calculate_psi_and_ks(base_vals, targ_vals)
+
+                
+                if psi < 0.1:
+                    level = "stable"
+                elif psi <= 0.25:
+                    level = "warning"
+                else:
+                    level = "critical"
+                    
+                if psi > max_overall_psi:
+                    max_overall_psi = psi
+                    
+                results.append((today_str, f, float(psi), float(ks), level))
+                print(f"Feature: {f:<20} | PSI: {psi:.4f} | KS: {ks:.4f} | Level: {level}")
+                
+        drift_df = spark.createDataFrame(results, ["date", "feature_name", "psi", "ks_statistic", "drift_level"])
+        
+        if DeltaTable.isDeltaTable(spark, drift_gold_path):
+            drift_df.write.format("delta").mode("append").save(drift_gold_path)
+        else:
+            drift_df.write.format("delta").mode("overwrite").save(drift_gold_path)
+            
+        print(f"Drift monitoring metrics written to Gold table: {drift_gold_path}")
+        
+        if max_overall_psi > 0.25:
+            status = "critical"
+        elif max_overall_psi >= 0.1:
+            status = "warning"
+        else:
+            status = "stable"
+            
+        with open("/tmp/drift_status", "w") as f:
+            f.write(status)
+        print(f"Overall Drift Status written to /tmp/drift_status: {status}")
+
+    except Exception as e:
+        print(f"Error during drift calculation: {str(e)}")
+        with open("/tmp/drift_status", "w") as f:
+            f.write("error")
+        sys.exit(1)
+    finally:
+        spark.stop()
+
+if __name__ == "__main__":
+    run_drift_monitoring()
+
+
+

@@ -3,7 +3,6 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, count, when, max as spark_max
 from delta.tables import DeltaTable
 
-# 🛠️ KHỞI TẠO SPARK
 spark = SparkSession.builder \
     .appName("FraudDetection_BronzeToSilver") \
     .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
@@ -11,21 +10,18 @@ spark = SparkSession.builder \
     .config("spark.sql.adaptive.enabled", "true") \
     .getOrCreate()
 
-# Tắt bớt log rác để màn hình Terminal/Airflow sạch sẽ hơn
 spark.sparkContext.setLogLevel("WARN")
 
-# Định nghĩa các đường dẫn lưu trữ trên hệ thống phân tán HDFS
-# Sử dụng cấu trúc thư mục chuẩn theo yêu cầu đồ án
-bronze_path = "hdfs://labsoe-17:9000/lakehouse/fraud_detection/bronze"
-silver_transactions_path = "hdfs://labsoe-17:9000/lakehouse/fraud_detection/silver/transactions"
-silver_states_path = "hdfs://labsoe-17:9000/lakehouse/fraud_detection/silver/customer_states"
-quarantine_path = "hdfs://labsoe-17:9000/lakehouse/fraud_detection/_quarantine"
+bronze_path = "hdfs:///lakehouse/fraud_detection/bronze"
+silver_transactions_path = "hdfs:///lakehouse/fraud_detection/silver/transactions"
+silver_states_path = "hdfs:///lakehouse/fraud_detection/silver/customer_states"
+quarantine_path = "hdfs:///lakehouse/fraud_detection/_quarantine"
 
-# 1. Đọc dữ liệu từ bảng Bronze Delta Table trên HDFS
+# 1. Read Bronze Delta Table
 print("Reading Bronze Delta table...")
 bronze_df = spark.read.format("delta").load(bronze_path)
 
-# 2. Lọc và cô lập các bản ghi không hợp lệ (Invalid Records)
+# 2. Filter invalid records for quarantine
 invalid_df = bronze_df.filter(
     (col("amount") <= 0) | 
     col("transaction_id").isNull() | 
@@ -33,13 +29,11 @@ invalid_df = bronze_df.filter(
     col("dest_account").isNull()
 )
 
-# Tránh dùng .rdd.isEmpty() vì nó kích hoạt một job thu thập dữ liệu về Master gây tốn RAM.
-# Sử dụng invalid_df.take(1) tối ưu hiệu năng và tài nguyên hơn rất nhiều.
 if len(invalid_df.take(1)) > 0:
     print("Writing invalid records to quarantine directory...")
     invalid_df.write.format("delta").mode("append").save(quarantine_path)
 
-# 3. Lọc lấy các bản ghi hợp lệ và loại bỏ trùng lặp mã giao dịch
+# 3. Filter valid records and remove duplicates
 valid_df = bronze_df.filter(
     (col("amount") > 0) & 
     col("transaction_id").isNotNull() & 
@@ -47,7 +41,7 @@ valid_df = bronze_df.filter(
     col("dest_account").isNotNull()
 ).dropDuplicates(["transaction_id"])
 
-# 4. Lưu trữ dữ liệu sạch vào tầng Silver Transactions (Có phân vùng theo ngày)
+# 4. Save clean data to Silver Transactions layer
 print("Saving cleaned transactions to Silver layer...")
 valid_df.write \
     .format("delta") \
@@ -56,7 +50,7 @@ valid_df.write \
     .option("overwriteSchema", "true") \
     .save(silver_transactions_path)
 
-# 5. Tính toán trạng thái tổng hợp của khách hàng (Customer States)
+# 5. Compute Customer States
 print("Computing Customer States...")
 customer_states = valid_df.groupBy("source_account").agg(
     count("transaction_id").alias("trans_count_total"),
@@ -64,7 +58,7 @@ customer_states = valid_df.groupBy("source_account").agg(
     spark_max("new_balance_source").alias("last_known_balance")
 ).withColumnRenamed("source_account", "account_id")
 
-# 6. Thực hiện MERGE / Upsert dữ liệu thông minh vào tầng Silver Customer States
+# 6. Execute MERGE / Upsert into Silver Customer States
 if DeltaTable.isDeltaTable(spark, silver_states_path):
     print("Executing Delta MERGE into Silver Customer States...")
     delta_silver = DeltaTable.forPath(spark, silver_states_path)
@@ -79,6 +73,5 @@ else:
     customer_states.write.format("delta").mode("overwrite").save(silver_states_path)
 
 print("Bronze to Silver ETL pipeline executed successfully.")
-
-# Dừng Spark session để giải phóng tài nguyên lập tức cho cụm
 spark.stop()
+

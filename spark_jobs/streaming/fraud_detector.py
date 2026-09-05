@@ -11,7 +11,6 @@ from pyspark.sql.types import (
 )
 from pyspark.ml import PipelineModel
 
-# Khoi tao SparkSession cho Cluster Mode
 spark = SparkSession.builder \
     .appName("FraudDetection_Realtime_Detector") \
     .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
@@ -20,13 +19,12 @@ spark = SparkSession.builder \
 
 spark.sparkContext.setLogLevel("WARN")
 
-model_path = "hdfs://labsoe-17:9000/lakehouse/fraud_detection/models/random_forest_fraud_model"
-checkpoint_path = "hdfs://labsoe-17:9000/lakehouse/fraud_detection/checkpoints/realtime_fraud_detector"
+model_path = "hdfs:///lakehouse/fraud_detection/models/gbt_fraud_model"
+checkpoint_path = "hdfs:///lakehouse/fraud_detection/checkpoints/realtime_fraud_detector"
 
-# 1. Load trained ML Pipeline Model tu HDFS
+print("Loading trained GBT Pipeline Model from HDFS...")
 model = PipelineModel.load(model_path)
 
-# 2. Schema Kafka payload
 schema = StructType([
     StructField("transaction_id", StringType(), False),
     StructField("source_account", StringType(), True),
@@ -44,7 +42,7 @@ schema = StructType([
     StructField("partition_date", StringType(), True)
 ])
 
-# 3. Read Stream tu Kafka Topic transactions
+print("Reading real-time transaction stream from Kafka...")
 kafka_stream_df = spark.readStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", "192.168.80.200:9092") \
@@ -53,7 +51,6 @@ kafka_stream_df = spark.readStream \
     .option("failOnDataLoss", "false") \
     .load()
 
-# 4. Feature Engineering
 parsed_df = kafka_stream_df.selectExpr("CAST(value AS STRING) as json_payload") \
     .select(from_json(col("json_payload"), schema).alias("data")) \
     .select("data.*") \
@@ -71,10 +68,9 @@ features_df = parsed_df.na.fill({
     "new_balance_dest": 0.0
 })
 
-# 5. ML Inference
+print("Executing ML inference on streaming micro-batches...")
 scored_df = model.transform(features_df)
 
-# 6. Loc cac giao dich gian lan
 fraud_alerts = scored_df.filter(col("prediction") == 1.0).select(
     col("transaction_id").alias("key"),
     to_json(struct(
@@ -89,7 +85,7 @@ fraud_alerts = scored_df.filter(col("prediction") == 1.0).select(
     )).alias("value")
 )
 
-# 7. Write ket qua ra Kafka topic fraud_alerts
+print("Publishing detected fraud alerts to Kafka topic 'fraud_alerts'...")
 query = fraud_alerts.writeStream \
     .format("kafka") \
     .option("kafka.bootstrap.servers", "192.168.80.200:9092") \

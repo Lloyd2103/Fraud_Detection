@@ -10,26 +10,42 @@ default_args = {
 }
 
 with DAG(
-    dag_id="monitor_streaming_job",
+    dag_id="streaming_monitor_dag",
     default_args=default_args,
-    description="Check health of Streaming Fraud Detector on YARN",
+    description="DAG 1: Streaming Job Health Monitoring and Auto-restart",
     schedule="*/10 * * * *",
     start_date=datetime(2026, 1, 1),
     catchup=False,
-    tags=["streaming", "yarn", "monitor"],
+    tags=["streaming", "monitor", "lakehouse"],
 ) as dag:
 
-    check_yarn_app = BashOperator(
-        task_id="check_yarn_streaming_app",
+
+    check_streaming_health = BashOperator(
+        task_id="check_streaming_health",
         bash_command="""
-        APP_COUNT=$(yarn application -list | grep -c "Streaming_Fraud_Detector")
-        if [ "$APP_COUNT" -eq 0 ]; then
-            echo "Streaming Job is not running! Triggering alert..."
+        export SPARK_HOME=/home/master/spark
+        PROC_COUNT=$(pgrep -f "FraudDetection_BronzeIngestion" || pgrep -f "FraudDetection_Realtime_Detector" || echo "")
+        if [ -z "$PROC_COUNT" ]; then
+            echo "Streaming job process not detected! Marking for restart."
             exit 1
         else
-            echo "Streaming Job is healthy and RUNNING."
+            echo "Streaming job is active and healthy (PIDs: $PROC_COUNT)."
+            exit 0
         fi
         """,
+        trigger_rule="all_success"
     )
 
-    check_yarn_app
+    restart_streaming_job = BashOperator(
+        task_id="restart_streaming_job",
+        bash_command="""
+        export SPARK_HOME=/home/master/spark
+        nohup $SPARK_HOME/bin/spark-submit \
+          /home/master/fraud_detection/spark_jobs/ingest/bronze_ingestion.py \
+          > /tmp/streaming_ingest.log 2>&1 &
+        echo "Streaming ingestion job successfully restarted."
+        """,
+        trigger_rule="one_failed"
+    )
+
+    check_streaming_health >> restart_streaming_job

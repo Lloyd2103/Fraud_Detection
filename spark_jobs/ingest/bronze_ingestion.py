@@ -14,7 +14,6 @@ from pyspark.sql.types import (
 
 print("--- INITIALIZING SPARK STRUCTURED STREAMING (STANDALONE MODE) ---")
 
-# 1. Khởi tạo Spark Session tích hợp Delta Lake
 spark = SparkSession.builder \
     .appName("FraudDetection_BronzeIngestion") \
     .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
@@ -25,11 +24,8 @@ spark = SparkSession.builder \
     .config("spark.executor.heartbeatInterval", "60s") \
     .getOrCreate()
 
-
-# Giảm thiểu tối đa log rác ghi xuống ổ đĩa Master
 spark.sparkContext.setLogLevel("WARN")
 
-# 2. Định nghĩa Schema khớp chính xác với luồng dữ liệu giao dịch
 schema = StructType([
     StructField("transaction_id", StringType(), False),
     StructField("source_account", StringType(), True),
@@ -47,36 +43,46 @@ schema = StructType([
     StructField("partition_date", DateType(), True)
 ])
 
-print("--- CONNECTING TO KAFKA BROKER (192.168.80.200:9092) ---")
+# Centralized Environment Configuration
+MASTER_IP = os.getenv("MASTER_IP", "192.168.80.200")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", f"{MASTER_IP}:9092")
+HDFS_HOST = os.getenv("HDFS_HOST", "labsoe-17")
 
-# 3. Kết nối luồng đọc thời gian thực từ Kafka Broker
+print(f"--- CONNECTING TO KAFKA BROKER ({KAFKA_BOOTSTRAP_SERVERS}) ---")
+
 kafka_stream_df = spark.readStream \
     .format("kafka") \
-    .option("kafka.bootstrap.servers", "192.168.80.200:9092") \
+    .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS) \
     .option("subscribe", "transactions") \
-    .option("startingOffsets", "latest") \
+    .option("startingOffsets", "earliest") \
     .option("failOnDataLoss", "false") \
-    .option("kafka.request.timeout.ms", "120000") \          
-    .option("kafka.session.timeout.ms", "60000") \         
-    .option("kafka.fetch.max.wait.ms", "10000") \           
-    .option("maxOffsetsPerTrigger", "50000") \              
+    .option("kafka.request.timeout.ms", "180000") \
+    .option("kafka.session.timeout.ms", "120000") \
+    .option("kafka.fetch.max.wait.ms", "30000") \
+    .option("maxOffsetsPerTrigger", "3000") \
     .load()
 
-# 4. Parse JSON Payload và CẤU HÌNH WATERMARK BẮT BUỘC
-# Thiết lập ngưỡng chịu lỗi cho dữ liệu đến muộn/lệch thứ tự tối đa 30 giây dựa trên cột Event Time (timestamp)
-parsed_stream_df = kafka_stream_df.selectExpr("CAST(value AS STRING) as json_payload") \
-    .select(from_json(col("json_payload"), schema).alias("data")) \
-    .select("data.*") \
-    .withWatermark("timestamp", "30 seconds") 
 
-# 5. Định nghĩa các đường dẫn lưu trữ tập trung bắt buộc trên HDFS
-bronze_table_path = "hdfs://labsoe-17:9000/lakehouse/fraud_detection/bronze"
-checkpoint_hdfs_path = "hdfs://labsoe-17:9000/lakehouse/fraud_detection/checkpoints/bronze_ingest"
+from pyspark.sql.functions import from_json, col, coalesce, current_timestamp
+
+# Configure stream parsing and partition date
+parsed_stream_df = kafka_stream_df.selectExpr("CAST(value AS STRING) as json_payload") \
+    .select(from_json(col("json_payload"), schema, {"timestampFormat": "yyyy-MM-dd HH:mm:ss"}).alias("data")) \
+    .select("data.*") \
+    .withColumn("timestamp", coalesce(col("timestamp"), current_timestamp())) \
+    .withColumn("partition_date", col("timestamp").cast(DateType()))
+
+
+
+bronze_table_path = f"hdfs://{HDFS_HOST}:9000/lakehouse/fraud_detection/bronze"
+checkpoint_hdfs_path = f"hdfs://{HDFS_HOST}:9000/lakehouse/fraud_detection/checkpoints/bronze_ingest"
+
+
 
 print(f"--- STREAMING DATA WRITING TO BRONZE DELTA LAKE: {bronze_table_path} ---")
 
-# 6. Thực hiện ghi luồng phân tán xuống HDFS (Có cơ chế Trigger & Checkpoint bảo vệ)
 query = parsed_stream_df.writeStream \
+    .queryName("Bronze_Kafka_Ingestion") \
     .format("delta") \
     .outputMode("append") \
     .partitionBy("partition_date") \
@@ -84,5 +90,6 @@ query = parsed_stream_df.writeStream \
     .trigger(processingTime="5 seconds") \
     .start(bronze_table_path)
 
-# Giữ tiến trình chạy liên tục không ngắt quãng
+
 query.awaitTermination()
+
