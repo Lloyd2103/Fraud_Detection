@@ -24,7 +24,7 @@ STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(
     title=settings.APP_NAME,
-    description="Real-Time Credit Card Fraud Detection Platform (Project 2 - bd02_gian_lan)",
+    description="Real-Time Credit Card Fraud Detection Platform",
     version=settings.APP_VERSION,
     docs_url="/docs",
     redoc_url="/redoc"

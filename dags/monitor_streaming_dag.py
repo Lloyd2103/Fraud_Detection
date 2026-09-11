@@ -23,7 +23,6 @@ with DAG(
     check_streaming_health = BashOperator(
         task_id="check_streaming_health",
         bash_command="""
-        export SPARK_HOME=/home/master/spark
         PROC_COUNT=$(pgrep -f "FraudDetection_BronzeIngestion" || pgrep -f "FraudDetection_Realtime_Detector" || echo "")
         if [ -z "$PROC_COUNT" ]; then
             echo "Streaming job process not detected! Marking for restart."
@@ -39,11 +38,10 @@ with DAG(
     restart_streaming_job = BashOperator(
         task_id="restart_streaming_job",
         bash_command="""
-        export SPARK_HOME=/home/master/spark
         nohup $SPARK_HOME/bin/spark-submit \
-          /home/master/fraud_detection/spark_jobs/ingest/bronze_ingestion.py \
-          > /tmp/streaming_ingest.log 2>&1 &
-        echo "Streaming ingestion job successfully restarted."
+          /home/master/fraud_detection/spark_jobs/streaming/fraud_detector.py \
+          > /tmp/streaming_detector.log 2>&1 &
+        echo "Streaming detector job successfully restarted."
         """,
         trigger_rule="one_failed"
     )

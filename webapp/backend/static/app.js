@@ -21,16 +21,16 @@ const state = {
   }
 };
 
-// API Endpoints
+// API Endpoints (DeTai2.pdf Section 2.8)
 const API = {
-  ALERTS: '/api/alerts',
-  ALERTS_SUMMARY: '/api/alerts/summary',
-  TRANSACTION: (id) => `/api/transactions/${id}`,
-  DECISION: (id) => `/api/transactions/${id}/decision`,
-  MODEL_PERF: '/api/audit/model-performance',
-  TIME_TRAVEL: (v) => `/api/audit/time-travel/${v}`,
-  RERUN_EVAL: (v) => `/api/audit/rerun-eval/${v}`,
-  LATENCY: '/api/latency/stats',
+  ALERTS: '/api/canhbao',
+  ALERTS_SUMMARY: '/api/canhbao/tong-quan',
+  TRANSACTION: (id) => `/api/giaodich/${id}`,
+  DECISION: (id) => `/api/giaodich/${id}/ket-luan`,
+  MODEL_PERF: '/api/mo-hinh/hieunang',
+  TIME_TRAVEL: (v) => `/api/kiemtoan/${v}`,
+  RERUN_EVAL: (v) => `/api/kiemtoan/${v}/danh-gia-lai`,
+  LATENCY: '/api/do-tre/thong-ke',
   HEALTH: '/api/health'
 };
 
@@ -258,7 +258,8 @@ function renderAlertsTable() {
   }
   
   tbody.innerHTML = state.filteredAlerts.map(tx => {
-    const score = parseFloat(tx.risk_score || 0);
+    const txId = tx.ma_giao_dich || tx.transaction_id || 'UNKNOWN';
+    const score = parseFloat(tx.diem_rui_ro !== undefined ? tx.diem_rui_ro : (tx.risk_score || 0));
     const scorePct = (score * 100).toFixed(1);
     const isHigh = score >= 0.8;
     const isMed = score >= 0.6 && score < 0.8;
@@ -273,29 +274,38 @@ function renderAlertsTable() {
       badgeClass = 'warning';
     }
     
-    const isProcessed = tx.inspection_status === 'PROCESSED';
+    const rawStatus = tx.trang_thai_tham_dinh || tx.inspection_status || '';
+    const isProcessed = rawStatus === 'PROCESSED' || rawStatus === 'da_xu_ly';
     const rowClass = isHigh && !isProcessed ? 'critical-row' : '';
     
-    const formattedAmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'VND', maximumFractionDigits: 0 }).format(tx.amount || 0);
+    const amt = tx.so_tien !== undefined ? tx.so_tien : (tx.amount || 0);
+    const formattedAmt = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'VND', maximumFractionDigits: 0 }).format(amt);
+    const rank = tx.xep_hang_trong_ngay || tx.daily_rank;
+    const timeStr = tx.thoi_diem || tx.timestamp || 'Mới nhận';
+    const latMs = tx.do_tre_ms !== undefined ? tx.do_tre_ms : (tx.latency_ms || 0);
+    const src = tx.tai_khoan_nguon || tx.source_account || 'N/A';
+    const dst = tx.tai_khoan_dich || tx.dest_account || 'N/A';
+    const channel = tx.kenh || tx.channel || 'ONLINE';
+    const ttype = tx.loai || tx.trans_type || 'TRANSFER';
     
     return `
       <tr class="${rowClass}">
         <td>
-          <strong style="color:#fff; font-family: monospace;">${tx.transaction_id}</strong>
-          <div style="font-size:0.72rem; color:var(--text-muted);">${tx.daily_rank ? 'Rank #' + tx.daily_rank : ''}</div>
+          <strong style="color:#fff; font-family: monospace;">${txId}</strong>
+          <div style="font-size:0.72rem; color:var(--text-muted);">${rank ? 'Hạng #' + rank : ''}</div>
         </td>
         <td>
-          <div>${tx.timestamp || 'Just now'}</div>
-          <div style="font-size:0.72rem; color:var(--text-muted);">Latency: ${tx.latency_ms || 850}ms</div>
+          <div>${timeStr}</div>
+          <div style="font-size:0.72rem; color:var(--text-muted);">Độ trễ: ${latMs}ms</div>
         </td>
         <td>
-          <span style="font-family:monospace; color:var(--text-secondary);">${tx.source_account || 'N/A'}</span>
+          <span style="font-family:monospace; color:var(--text-secondary);">${src}</span>
           <span style="color:var(--text-muted); margin: 0 4px;">➔</span>
-          <span style="font-family:monospace; color:var(--text-secondary);">${tx.dest_account || 'N/A'}</span>
+          <span style="font-family:monospace; color:var(--text-secondary);">${dst}</span>
         </td>
         <td>
-          <span class="badge neutral">${tx.channel || 'ONLINE'}</span>
-          <span class="badge neutral" style="margin-left:4px;">${tx.trans_type || 'TRANSFER'}</span>
+          <span class="badge neutral">${channel}</span>
+          <span class="badge neutral" style="margin-left:4px;">${ttype}</span>
         </td>
         <td style="font-weight:600;">${formattedAmt}</td>
         <td>
@@ -305,13 +315,13 @@ function renderAlertsTable() {
         </td>
         <td>
           ${isProcessed ? 
-            `<span class="badge success">✓ Inspected</span>` : 
-            `<span class="badge danger">Pending Review</span>`
+            `<span class="badge success">✓ Đã thẩm định</span>` : 
+            `<span class="badge danger">Chờ thẩm định</span>`
           }
         </td>
         <td>
-          <button class="btn btn-sm btn-primary" onclick="inspectTransaction('${tx.transaction_id}')">
-            🔍 Inspect
+          <button class="btn btn-sm btn-primary" onclick="inspectTransaction('${txId}')">
+            🔍 Thẩm định
           </button>
         </td>
       </tr>
@@ -559,9 +569,13 @@ async function submitVerdictAction(txId, labelValue) {
   
   const payload = {
     label: labelValue,
+    nhan: labelValue,
     inspector_id: inspector,
+    nguoi_tham_dinh: inspector,
     reason: reason,
-    processing_time_seconds: timeSeconds
+    ly_do: reason,
+    processing_time: timeSeconds,
+    thoi_gian_xu_ly_giay: timeSeconds
   };
   
   try {

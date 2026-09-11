@@ -7,8 +7,9 @@ Complies with DeTai_2.pdf section 2.8 requirement (< 5 seconds SLA).
 from fastapi import APIRouter
 from app.services.lakehouse_service import lakehouse_service
 
-router = APIRouter(tags=["Latency & SLA"])
+router = APIRouter(tags=["Latency & SLA / Do Tre He Thong"])
 
+@router.get("/do-tre/thong-ke")
 @router.get("/latency/stats")
 def get_latency_statistics():
     """

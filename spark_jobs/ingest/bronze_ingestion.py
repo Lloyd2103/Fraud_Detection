@@ -87,6 +87,7 @@ query = parsed_stream_df.writeStream \
     .outputMode("append") \
     .partitionBy("partition_date") \
     .option("checkpointLocation", checkpoint_hdfs_path) \
+    .option("mergeSchema", "true") \
     .trigger(processingTime="5 seconds") \
     .start(bronze_table_path)
 

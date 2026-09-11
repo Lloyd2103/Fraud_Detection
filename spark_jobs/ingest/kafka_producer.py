@@ -14,7 +14,7 @@ TOPIC_NAME = os.getenv("KAFKA_TOPIC", "transactions")
 CSV_FILE_PATH = os.getenv("CSV_FILE_PATH", "/home/master/PS_20174392719_1491204439457_log.csv")
 
 CHANNELS = ["ATM", "POS", "ONLINE", "APP"]
-BATCH_SIZE = 100  # Số record mỗi batch trước khi flush
+BATCH_SIZE = 100  # Number of records per batch before flush
 
 producer = KafkaProducer(
     bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
@@ -26,7 +26,7 @@ def flush_step_records(records, step):
     now = datetime.now()
     processed_records = []
 
-    # Bước 1: Gán thời gian với độ trễ ngẫu nhiên (0-30s)
+    # Step 1: Assign timestamps with random watermark delay (0-30s)
     for record in records:
         delay_seconds = random.randint(0, 30)
         event_time = now - timedelta(seconds=delay_seconds)
@@ -35,22 +35,22 @@ def flush_step_records(records, step):
         record["partition_date"] = event_time.strftime("%Y-%m-%d")
         processed_records.append(record)
 
-    # Bước 2: Xáo trộn thứ tự để mô phỏng dữ liệu đến lộn xộn
+    # Step 2: Shuffle records to simulate out-of-order data ingestion
     random.shuffle(processed_records)
 
-    # Bước 3: Gửi dữ liệu phân tán đều qua 4 Partitions (0, 1, 2, 3)
+    # Step 3: Publish records evenly across 4 partitions
     NUM_PARTITIONS = 4
     count = 0
     for record in processed_records:
         key = record["source_account"]
-        target_partition = count % NUM_PARTITIONS  # Phân tán tròn 4 Partitions
+        target_partition = count % NUM_PARTITIONS  # Round-robin distribution
         producer.send(TOPIC_NAME, key=key, value=record, partition=target_partition)
         count += 1
         if count % BATCH_SIZE == 0:
             producer.flush()
-            time.sleep(0.05)  # Giảm tải cho broker
+            time.sleep(0.05)  # Throttle to prevent broker overload
 
-    producer.flush()  # Flush phần còn lại
+    producer.flush()  # Flush remaining batch
     print(f"Pushed {len(processed_records)} out-of-order transactions evenly across 4 Partitions (Step {step})")
 
 
@@ -84,10 +84,10 @@ def stream_transactions():
                 flush_step_records(step_records, current_step)
                 current_step = step
                 step_records = [record]
-                time.sleep(10)  # Mô phỏng 1 giờ (Step) nén còn 10 giây thực theo đúng yêu cầu đề bài
+                time.sleep(10)  # Compress 1 simulation hour into 10 seconds real-time
 
 
-        # Xử lý step cuối cùng
+        # Process final step
         if step_records:
             flush_step_records(step_records, current_step)
 

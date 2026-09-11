@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Human-in-the-Loop Fraud Investigation Console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <!-- Top Navigation Header -->
+    <header class="app-header">
+        <div class="brand">
+            <div class="logo-icon">🚨</div>
+            <div>
+                <h1>Human-in-the-Loop Fraud Review Console</h1>
+                <p class="subtitle">DeTai2.pdf Section 2.8 • Auditor Feedback Loop & Model Retraining Interface</p>
+            </div>
+        </div>
+        <div class="header-actions">
+            <div class="api-status" id="apiStatusBadge">
+                <span class="status-dot pulsing"></span>
+                <span id="apiStatusText">Connecting to API...</span>
+            </div>
+            <button id="btnAutoRefresh" class="btn btn-secondary btn-sm">
+                <span class="pulse-icon">🔄</span> Auto Refresh (5s)
+            </button>
+        </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="dashboard-container">
+        <!-- Sidebar: Inspection Queue -->
+        <aside class="sidebar-panel">
+            <div class="panel-header">
+                <h2>Pending Inspection Queue</h2>
+                <span class="badge badge-warning" id="pendingCount">0 Pending</span>
+            </div>
+
+            <div class="search-box">
+                <input type="text" id="searchInput" placeholder="Search TX ID or Account..." />
+            </div>
+
+            <div class="alerts-list" id="alertsList">
+                <div class="empty-state">
+                    <p>Loading alerts from Gold Risk Scores table...</p>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Center Details & Feedback Action Panel -->
+        <section class="main-panel">
+            <div class="panel-header">
+                <h2>Transaction Deep Analysis & Feedback Loop</h2>
+                <div id="activeTxBadge" class="tx-badge hidden">TX_SELECTED</div>
+            </div>
+
+            <!-- Selection Placeholder -->
+            <div id="noSelectionState" class="empty-detail-state">
+                <div class="placeholder-icon">🔍</div>
+                <h3>Select a Pending Transaction to Inspect</h3>
+                <p>Choose an alert from the queue on the left to view transaction metadata, Explainable AI (XAI) risk factors, and submit an auditor verdict to trigger the feedback retraining loop.</p>
+            </div>
+
+            <!-- Active Inspection Workspace -->
+            <div id="inspectionWorkspace" class="inspection-workspace hidden">
+                <!-- Metadata Cards Grid -->
+                <div class="metadata-grid">
+                    <div class="info-card">
+                        <span class="card-label">Risk Score</span>
+                        <div class="risk-score-display">
+                            <span class="score-value" id="detailRiskScore">0.0%</span>
+                            <span class="score-pill" id="detailRiskPill">HIGH RISK</span>
+                        </div>
+                    </div>
+
+                    <div class="info-card">
+                        <span class="card-label">Transaction Amount</span>
+                        <span class="card-value highlight-amount" id="detailAmount">0.00 VND</span>
+                    </div>
+
+                    <div class="info-card">
+                        <span class="card-label">Transaction Type & Channel</span>
+                        <span class="card-value" id="detailTypeChannel">TRANSFER • ONLINE</span>
+                    </div>
+
+                    <div class="info-card">
+                        <span class="card-label">Model Version & Latency</span>
+                        <span class="card-value mono" id="detailModelLatency">GBT_v1.0 (120 ms)</span>
+                    </div>
+                </div>
+
+                <!-- Accounts Breakdown -->
+                <div class="accounts-banner">
+                    <div class="account-box">
+                        <span class="acc-title">Source Account</span>
+                        <span class="acc-number mono" id="detailSrcAcc">C12345678</span>
+                    </div>
+                    <div class="transfer-arrow">➡️</div>
+                    <div class="account-box">
+                        <span class="acc-title">Destination Account</span>
+                        <span class="acc-number mono" id="detailDstAcc">M98765432</span>
+                    </div>
+                </div>
+
+                <!-- Explainable AI (XAI) Risk Factors -->
+                <div class="section-card">
+                    <div class="card-header-sm">
+                        <h3>🧠 Explainable AI (XAI) Top Risk Factors</h3>
+                        <span class="text-muted">Features contributing to high fraud probability</span>
+                    </div>
+                    <div class="risk-factors-container" id="riskFactorsContainer">
+                        <!-- Populated by JS -->
+                    </div>
+                </div>
+
+                <!-- Auditor Feedback Submission Form -->
+                <div class="section-card feedback-form-card">
+                    <div class="card-header-sm">
+                        <h3>✍️ Auditor Verdict & Feedback Loop Submission</h3>
+                        <div class="timer-box">
+                            <span>Inspection Duration:</span>
+                            <span class="timer-value mono" id="timerDisplay">00:00</span>
+                        </div>
+                    </div>
+
+                    <form id="verdictForm" onsubmit="return false;">
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="auditorInput">Auditor ID / Username</label>
+                                <input type="text" id="auditorInput" value="auditor_admin" required />
+                            </div>
+
+                            <div class="form-group">
+                                <label for="reasonInput">Reason Category / Notes</label>
+                                <select id="reasonInput">
+                                    <option value="Abnormal Amount Ratio">Abnormal Amount Ratio</option>
+                                    <option value="Source Balance Error Shift">Source Balance Error Shift</option>
+                                    <option value="Suspicious New Destination Account">Suspicious New Destination Account</option>
+                                    <option value="User Confirmed Legitimate Transaction">User Confirmed Legitimate Transaction</option>
+                                    <option value="Other Analytical Reason">Other Analytical Reason</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="verdict-actions">
+                            <button type="button" class="btn btn-danger btn-lg" id="btnConfirmFraud" onclick="submitVerdict(1)">
+                                🚨 Confirm Fraud (Label = 1)
+                            </button>
+                            <button type="button" class="btn btn-success btn-lg" id="btnClearLegit" onclick="submitVerdict(0)">
+                                ✅ Clear Legitimate (Label = 0)
+                            </button>
+                        </div>
+                    </form>
+
+                    <div id="submissionAlert" class="submission-alert hidden"></div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Recent Feedback Submissions History -->
+    <footer class="history-footer">
+        <div class="history-header">
+            <h4>📋 Feedback Loop History (Written to silver.inspection_decisions)</h4>
+            <span class="history-sub">Submissions here automatically trigger weekly Airflow DAG 3 model retraining</span>
+        </div>
+        <div class="history-table-wrapper">
+            <table class="history-table">
+                <thead>
+                    <tr>
+                        <th>Transaction ID</th>
+                        <th>Auditor Verdict</th>
+                        <th>Auditor ID</th>
+                        <th>Reason</th>
+                        <th>Handling Duration</th>
+                        <th>Inspected At</th>
+                    </tr>
+                </thead>
+                <tbody id="historyTableBody">
+                    <tr class="empty-row"><td colspan="6">No feedback verdicts submitted in this session yet.</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </footer>
+
+    <script src="app.js"></script>
+</body>
+</html>

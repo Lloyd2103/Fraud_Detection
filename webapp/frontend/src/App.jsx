@@ -21,7 +21,7 @@ export default function App() {
           <span style={{ fontSize: '1.5rem' }}>🛡️</span>
           <div>
             <h1 style={{ fontSize: '1.1rem', fontWeight: 700 }}>FRAUD SENTINEL AI</h1>
-            <p style={{ fontSize: '0.72rem', color: '#94a3b8' }}>Project 2 (bd02_gian_lan) • Lakehouse Delta Platform</p>
+            <p style={{ fontSize: '0.72rem', color: '#94a3b8' }}>Lakehouse Delta Platform</p>
           </div>
         </div>
 
@@ -63,7 +63,7 @@ export default function App() {
 
       {/* Footer */}
       <footer style={{ background: '#111827', borderTop: '1px solid rgba(255,255,255,0.08)', padding: '0.8rem 2rem', fontSize: '0.75rem', color: '#64748b', display: 'flex', justifyContent: 'space-between' }}>
-        <span>Big Data Capstone — Project 2 (bd02_gian_lan)</span>
+        <span>Big Data Capstone</span>
         <span>HDFS: labsoe-17:9000 • Spark 3.5 • Kafka: 192.168.80.200:9092</span>
       </footer>
     </div>

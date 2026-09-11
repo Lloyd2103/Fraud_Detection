@@ -24,7 +24,16 @@ def get_spark_session() -> SparkSession:
     try:
         # Ensure environment variables are loaded
         os.environ.setdefault("HADOOP_HOME", "/home/master/hadoop-3.5.0")
+        os.environ.setdefault("HADOOP_CONF_DIR", "/home/master/hadoop-3.5.0/etc/hadoop")
         os.environ.setdefault("SPARK_HOME", "/home/master/spark")
+        
+        ivy_jars_dir = "/home/master/.ivy2/jars"
+        delta_jars = [
+            f"{ivy_jars_dir}/io.delta_delta-spark_2.12-3.1.0.jar",
+            f"{ivy_jars_dir}/io.delta_delta-storage-3.1.0.jar",
+            f"{ivy_jars_dir}/org.antlr_antlr4-runtime-4.9.3.jar"
+        ]
+        available_jars = [j for j in delta_jars if os.path.exists(j)]
         
         builder = SparkSession.builder \
             .appName(f"FraudDetection_WebApp_{os.getpid()}") \
@@ -36,9 +45,16 @@ def get_spark_session() -> SparkSession:
             .config("spark.sql.shuffle.partitions", "4") \
             .config("spark.ui.enabled", "false")
             
+        if available_jars:
+            builder = builder.config("spark.jars", ",".join(available_jars))
+        else:
+            builder = builder.config("spark.jars.packages", "io.delta:delta-spark_2.12:3.1.0")
+
         _spark_session = builder.getOrCreate()
         _spark_session.sparkContext.setLogLevel("WARN")
         return _spark_session
     except Exception as e:
-        print(f"[SparkSession Warning] Could not initialize PySpark session directly: {e}", file=sys.stderr)
+        import traceback
+        print(f"[SparkSession Error] Could not initialize PySpark session: {e}", file=sys.stderr)
+        traceback.print_exc()
         raise e

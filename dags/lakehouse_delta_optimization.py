@@ -26,7 +26,4 @@ with DAG(
         """
     )
 
-
-
-
     optimize_and_vacuum_tables
