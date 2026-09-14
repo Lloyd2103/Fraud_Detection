@@ -38,9 +38,9 @@ schema = StructType([
     StructField("new_balance_dest", DoubleType(), True),
     StructField("channel", StringType(), True),
     StructField("is_fraud_label", IntegerType(), True),
-    StructField("timestamp", TimestampType(), True),
-    StructField("received_at", TimestampType(), True),
-    StructField("partition_date", DateType(), True)
+    StructField("timestamp", StringType(), True),
+    StructField("received_at", StringType(), True),
+    StructField("partition_date", StringType(), True)
 ])
 
 # Centralized Environment Configuration
@@ -63,14 +63,15 @@ kafka_stream_df = spark.readStream \
     .load()
 
 
-from pyspark.sql.functions import from_json, col, coalesce, current_timestamp
+from pyspark.sql.functions import from_json, col, coalesce, current_timestamp, to_timestamp
 
 # Configure stream parsing and partition date
 parsed_stream_df = kafka_stream_df.selectExpr("CAST(value AS STRING) as json_payload") \
-    .select(from_json(col("json_payload"), schema, {"timestampFormat": "yyyy-MM-dd HH:mm:ss"}).alias("data")) \
+    .select(from_json(col("json_payload"), schema).alias("data")) \
     .select("data.*") \
-    .withColumn("timestamp", coalesce(col("timestamp"), current_timestamp())) \
+    .withColumn("timestamp", coalesce(to_timestamp(col("timestamp")), current_timestamp())) \
     .withColumn("partition_date", col("timestamp").cast(DateType()))
+
 
 
 

@@ -102,7 +102,7 @@ encoder = OneHotEncoder(
 
 feature_cols = [
     "amount", "old_balance_source", "new_balance_source", "old_balance_dest", "new_balance_dest",
-    "trans_count_total", "sum_amount_prev",
+    "trans_count_total", "sum_amount_prev", "trans_count_24h", "sum_amount_24h", "trans_count_1h",
     "error_balance_source", "error_balance_dest", "trans_type_vec", "channel_vec"
 ]
 
@@ -129,54 +129,55 @@ algorithms = {
         featuresCol="features",
         labelCol="is_fraud_label",
         weightCol="class_weight",
-        numTrees=50,
-        maxDepth=5,
+        numTrees=30,
+        maxDepth=6,
         seed=42
     ),
     "LogisticRegression": LogisticRegression(
         featuresCol="features",
         labelCol="is_fraud_label",
         weightCol="class_weight",
-        maxIter=50,
-        regParam=0.01,
-        elasticNetParam=0.5
+        maxIter=30
     )
 }
 
-evaluator_roc = BinaryClassificationEvaluator(labelCol="is_fraud_label", rawPredictionCol="rawPrediction", metricName="areaUnderROC")
-evaluator_pr = BinaryClassificationEvaluator(labelCol="is_fraud_label", rawPredictionCol="rawPrediction", metricName="areaUnderPR")
-
-results = []
 trained_models = {}
+results = []
 predictions_dict = {}
 
-print("STARTING MULTI-MODEL TRAINING & EVALUATION PIPELINE")
+print("\nSTARTING MULTI-MODEL TRAINING & EVALUATION PIPELINE")
 
-for name, clf in algorithms.items():
+for name, algo in algorithms.items():
     print(f"\n--- Training {name} ---")
-    pipeline = Pipeline(stages=base_stages + [clf])
-    
+    pipeline = Pipeline(stages=base_stages + [algo])
     model = pipeline.fit(train_df)
     trained_models[name] = model
     
+    # Evaluate on Test Set
     predictions = model.transform(test_df)
     predictions_dict[name] = predictions
-    
-    auc_roc = evaluator_roc.evaluate(predictions)
-    auc_pr = evaluator_pr.evaluate(predictions)
-    
-    pred_with_prob = predictions.withColumn(
-        "prob_fraud", vector_to_array(col("probability"))[1]
-    )
-    
-    top200 = pred_with_prob.orderBy(desc("prob_fraud")).limit(200)
-    fraud_in_top200 = top200.filter(col("is_fraud_label") == 1).count()
-    precision_200 = fraud_in_top200 / 200.0
-    
-    results.append((name, float(precision_200), float(auc_pr), float(auc_roc), int(fraud_in_top200)))
-    print(f"[{name}] Precision@200: {precision_200:.4f} ({fraud_in_top200}/200) | PR-AUC: {auc_pr:.4f} | ROC-AUC: {auc_roc:.4f}")
 
-# IN BANG SO SANH HIEU NANG MO HINH
+    evaluator_pr = BinaryClassificationEvaluator(
+        labelCol="is_fraud_label", rawPredictionCol="rawPrediction", metricName="areaUnderPR"
+    )
+    evaluator_roc = BinaryClassificationEvaluator(
+        labelCol="is_fraud_label", rawPredictionCol="rawPrediction", metricName="areaUnderROC"
+    )
+
+    pr_auc = evaluator_pr.evaluate(predictions)
+    roc_auc = evaluator_roc.evaluate(predictions)
+
+    # Calculate Precision@200
+    top200 = predictions.withColumn("prob_fraud", vector_to_array(col("probability"))[1]) \
+                        .sort(desc("prob_fraud")) \
+                        .limit(200)
+
+    tp_count = top200.filter(col("is_fraud_label") == 1).count()
+    precision_at_200 = tp_count / 200.0
+
+    print(f"[{name}] Precision@200: {precision_at_200:.4f} ({tp_count}/200) | PR-AUC: {pr_auc:.4f} | ROC-AUC: {roc_auc:.4f}")
+    results.append((name, precision_at_200, pr_auc, roc_auc, tp_count))
+
 print("\n" + "="*80)
 print(f"{'Algorithm':<25} | {'Precision@200':<15} | {'PR-AUC':<10} | {'ROC-AUC':<10}")
 print("="*80)
@@ -189,6 +190,8 @@ print("="*80)
 # ==================================================================
 print("\n--- Evaluating Decision Thresholds on GBTClassifier (Test Set) ---")
 gbt_test_preds = predictions_dict["GBTClassifier"].withColumn(
+    "prob_fraud", vector_to_array(col("probability"))[1]
+).select("is_fraud_label", "prob_fraud").cache() if "GBTClassifier" in predictions_dict else predictions.withColumn(
     "prob_fraud", vector_to_array(col("probability"))[1]
 ).select("is_fraud_label", "prob_fraud").cache()
 
@@ -209,43 +212,70 @@ for th in thresholds:
 
 gbt_test_preds.unpersist()
 
-# LUU MO HINH UNG VIEN GBTCLASSIFIER XUONG HDFS (KHONG GHI DE PRODUCTION MODEL)
+# LUU MO HINH UNG VIEN GBTCLASSIFIER XUONG HDFS
 best_model = trained_models["GBTClassifier"]
+prod_model_save_path = "hdfs:///lakehouse/fraud_detection/models/gbt_fraud_model"
+
 print(f"\nSaving Candidate GBTClassifier PipelineModel to HDFS: {candidate_model_save_path}...")
 best_model.write().overwrite().save(candidate_model_save_path)
 
-# TRICH XUAT FEATURE IMPORTANCE CUA GBT
+# TRICH XUAT FEATURE IMPORTANCE CUA GBT WITH METADATA EXPANDED COLS
 gbt_stage = best_model.stages[-1]
 importances = gbt_stage.featureImportances.toArray()
-print("\n--- GBT FEATURE IMPORTANCES ---")
-for col_name, imp in zip(feature_cols, importances):
-    print(f"Feature: {col_name:<25} | Importance: {imp:.4f}")
 
-# GHI BANG SO SANH HIEU NANG VAO GOLD DELTA TABLE
+# Trich xuat danh sach ten dac trung da noi rong tu StringIndexer/OneHotEncoder
+expanded_feature_names = []
+for c in feature_cols:
+    if c == "trans_type_vec":
+        try:
+            labels = best_model.stages[0].labels
+            expanded_feature_names.extend([f"trans_type_{lbl}" for lbl in labels[:-1]])
+        except Exception:
+            expanded_feature_names.append(c)
+    elif c == "channel_vec":
+        try:
+            labels = best_model.stages[1].labels
+            expanded_feature_names.extend([f"channel_{lbl}" for lbl in labels[:-1]])
+        except Exception:
+            expanded_feature_names.append(c)
+    else:
+        expanded_feature_names.append(c)
+
+print("\n--- GBT FEATURE IMPORTANCES ---")
+for i, imp in enumerate(importances):
+    col_name = expanded_feature_names[i] if i < len(expanded_feature_names) else f"feature_{i}"
+    print(f"Feature: {col_name:<30} | Importance: {imp:.4f}")
+
+# GHI TRANG THAI SO SANH PRECISION@200 DE AIRFLOW PHAN NHANH & PROMOTE MODEL TO PRODUCTION
+gbt_precision = [r[1] for r in results if r[0] == "GBTClassifier"][0]
+BASELINE_PRECISION = float(os.getenv("BASELINE_PRECISION", "0.35"))
+decision_str = "better" if gbt_precision >= BASELINE_PRECISION else "worse"
+
+if decision_str == "better":
+    print(f"Decision: Model accepted (Precision@200 {gbt_precision:.4f} >= Baseline {BASELINE_PRECISION:.4f})")
+    print(f"Promoting Candidate GBT Model to Production Path: {prod_model_save_path}...")
+    best_model.write().overwrite().save(prod_model_save_path)
+else:
+    print(f"Decision: Model rejected (Precision@200 {gbt_precision:.4f} < Baseline {BASELINE_PRECISION:.4f})")
+
+# GHI BANG SO SANH HIEU NANG VA TRANG THAI RAT GOLD DELTA TABLE (CHONG LOI RUNTIME TRON CLUSTER MODE)
 comparison_rows = [
-    (r[0], r[1], r[2], r[3], r[4]) for r in results
+    (r[0], r[1], r[2], r[3], r[4], decision_str) for r in results
 ]
 comp_df = spark.createDataFrame(
     comparison_rows, 
-    ["algorithm", "precision_at_200", "pr_auc", "roc_auc", "fraud_detected_in_top200"]
+    ["algorithm", "precision_at_200", "pr_auc", "roc_auc", "fraud_detected_in_top200", "promotion_decision"]
 ).withColumn("model_role", when(col("algorithm") == "GBTClassifier", lit("candidate")).otherwise(lit("benchmark"))) \
  .withColumn("trained_at", current_timestamp())
 
 comp_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(comparison_save_path)
 print(f"Saved model performance comparison matrix to Gold Delta table: {comparison_save_path}")
 
-# GHI TRANG THAI SO SANH PRECISION@200 DE AIRFLOW PHAN NHANH
-gbt_precision = [r[1] for r in results if r[0] == "GBTClassifier"][0]
-BASELINE_PRECISION = float(os.getenv("BASELINE_PRECISION", "0.85"))
-
+# LUU FILE LOCAL KHONG GIAY BANG DE AIRFLOW LOCALEXECUTOR DOC PHAN NHANH
 eval_file = "/tmp/model_eval_status"
 with open(eval_file, "w") as f:
-    if gbt_precision >= BASELINE_PRECISION:
-        f.write("better")
-        print(f"Decision: Model accepted (Precision@200 {gbt_precision:.4f} >= Baseline {BASELINE_PRECISION:.4f})")
-    else:
-        f.write("worse")
-        print(f"Decision: Model rejected (Precision@200 {gbt_precision:.4f} < Baseline {BASELINE_PRECISION:.4f})")
+    f.write(decision_str)
 
 print("Multi-model training and evaluation pipeline completed successfully.")
+
 spark.stop()

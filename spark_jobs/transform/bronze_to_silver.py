@@ -52,25 +52,47 @@ valid_df.write \
 
 # 5. Compute Customer States
 print("Computing Customer States...")
+from pyspark.sql.functions import sum as spark_sum, avg as spark_avg
 customer_states = valid_df.groupBy("source_account").agg(
     count("transaction_id").alias("trans_count_total"),
+    spark_sum("amount").alias("total_amount_24h"),
+    spark_avg("amount").alias("avg_amount_30d"),
     spark_max("timestamp").alias("last_active_time"),
     spark_max("new_balance_source").alias("last_known_balance")
 ).withColumnRenamed("source_account", "account_id")
 
+
 # 6. Execute MERGE / Upsert into Silver Customer States
 if DeltaTable.isDeltaTable(spark, silver_states_path):
     print("Executing Delta MERGE into Silver Customer States...")
-    delta_silver = DeltaTable.forPath(spark, silver_states_path)
-    delta_silver.alias("target").merge(
-        customer_states.alias("source"),
-        "target.account_id = source.account_id"
-    ).whenMatchedUpdateAll() \
-     .whenNotMatchedInsertAll() \
-     .execute()
+    try:
+        delta_silver = DeltaTable.forPath(spark, silver_states_path)
+        delta_silver.alias("target").merge(
+            customer_states.alias("source"),
+            "target.account_id = source.account_id"
+        ).whenMatchedUpdate(set={
+            "account_id": "source.account_id",
+            "trans_count_total": "source.trans_count_total",
+            "total_amount_24h": "source.total_amount_24h",
+            "avg_amount_30d": "source.avg_amount_30d",
+            "last_active_time": "source.last_active_time",
+            "last_known_balance": "source.last_known_balance"
+        }).whenNotMatchedInsert(values={
+            "account_id": "source.account_id",
+            "trans_count_total": "source.trans_count_total",
+            "total_amount_24h": "source.total_amount_24h",
+            "avg_amount_30d": "source.avg_amount_30d",
+            "last_active_time": "source.last_active_time",
+            "last_known_balance": "source.last_known_balance"
+        }).execute()
+    except Exception as e_merge:
+        print(f"Notice: Schema variation detected during MERGE ({e_merge}). Overwriting schema...")
+        customer_states.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(silver_states_path)
 else:
     print("Creating Silver Customer States table for the first time...")
-    customer_states.write.format("delta").mode("overwrite").save(silver_states_path)
+    customer_states.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(silver_states_path)
+
+
 
 print("Bronze to Silver ETL pipeline executed successfully.")
 spark.stop()

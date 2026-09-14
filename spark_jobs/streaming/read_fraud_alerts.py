@@ -13,11 +13,11 @@ def main():
     bootstrap_servers = ["192.168.80.200:9092"]
     topic_name = "alerts"
 
-    print("                      REAL-TIME FRAUD ALERTS MONITORING CONSOLE                           ")
+    print("REAL-TIME FRAUD ALERTS MONITORING CONSOLE")
     print(f"Target Broker : {bootstrap_servers}")
     print(f"Target Topic  : {topic_name}")
     print("Mode          : Direct Partition Assignment (No Group Coordinator)")
-    print("------------------------------------------------------------------------------------------")
+
     sys.stdout.flush()
 
     try:

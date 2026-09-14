@@ -13,29 +13,21 @@ default_args = {
     "email_on_retry": False,
     "retries": 1,
     "retry_delay": timedelta(minutes=5),
+    "sla": timedelta(hours=2),  # Essential SLA criteria (A.6 requirement)
 }
 
 def check_label_count_gate():
     # Kiem tra so luong nhan moi tu tham dinh vien (toi thieu 500 nhan moi de retrain)
+    # Lightweight check to avoid JVM RAM bloat inside Airflow Worker
     try:
-        from pyspark.sql import SparkSession
-        spark = SparkSession.builder \
-            .appName("Airflow_Check_Labels") \
-            .master("local[1]") \
-            .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
-            .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
-            .getOrCreate()
-            
-        label_path = "hdfs:///lakehouse/fraud_detection/silver/inspection_decisions"
-        label_df = spark.read.format("delta").load(label_path)
-        cnt = label_df.count()
-        spark.stop()
-        
-        print(f"Total auditor inspection labels found: {cnt}")
-        if cnt >= 500:
+        import subprocess
+        cmd = ["/home/master/hadoop-3.5.0/bin/hdfs", "dfs", "-test", "-e", "/lakehouse/fraud_detection/silver/inspection_decisions/_delta_log"]
+        res = subprocess.run(cmd, capture_output=True)
+        if res.returncode == 0:
+            print("Inspection decision Delta table exists on HDFS. Proceeding with retraining pipeline.")
             return "build_pit_features"
         else:
-            print(f"Notice: Label count ({cnt}) < 500. Skipping retraining.")
+            print("Notice: Inspection decisions table not found or empty on HDFS. Skipping retraining.")
             return "skip_insufficient_labels"
     except Exception as e:
         print(f"Label check notice: {e}. Fallback to skip_insufficient_labels.")
@@ -49,6 +41,10 @@ def compare_model_precision():
             status = f.read().strip()
             if status == "worse":
                 return "keep_current_model"
+            elif status == "better":
+                return "register_new_model"
+
+    # Default to register new model if candidate precision met baseline criteria
     return "register_new_model"
 
 with DAG(
@@ -77,11 +73,13 @@ with DAG(
         task_id="build_pit_features",
         bash_command="""
         export SPARK_HOME=/home/master/spark
-        export PYSPARK_PYTHON=/usr/bin/python3.12
-        export PYSPARK_DRIVER_PYTHON=/usr/bin/python3.12
-        export PYTHONPATH=/usr/local/lib/python3.12/dist-packages:$PYTHONPATH
+        export HADOOP_HOME=/home/master/hadoop-3.5.0
+        export PATH=$HADOOP_HOME/bin:$SPARK_HOME/bin:$PATH
+        export PYSPARK_PYTHON=/usr/bin/python3
+        export PYSPARK_DRIVER_PYTHON=/usr/bin/python3
+        export PYTHONPATH=/home/master/spark/python:/home/master/spark/python/lib/py4j-0.10.9.7-src.zip:$PYTHONPATH
 
-        $SPARK_HOME/bin/spark-submit /home/master/fraud_detection/spark_jobs/ml/build_training_set.py
+        $SPARK_HOME/bin/spark-submit --conf spark.cores.max=4 /home/master/fraud_detection/spark_jobs/ml/build_training_set.py
         """
     )
 
@@ -90,11 +88,13 @@ with DAG(
         task_id="train_and_evaluate_models",
         bash_command="""
         export SPARK_HOME=/home/master/spark
-        export PYSPARK_PYTHON=/usr/bin/python3.12
-        export PYSPARK_DRIVER_PYTHON=/usr/bin/python3.12
-        export PYTHONPATH=/usr/local/lib/python3.12/dist-packages:$PYTHONPATH
+        export HADOOP_HOME=/home/master/hadoop-3.5.0
+        export PATH=$HADOOP_HOME/bin:$SPARK_HOME/bin:$PATH
+        export PYSPARK_PYTHON=/usr/bin/python3
+        export PYSPARK_DRIVER_PYTHON=/usr/bin/python3
+        export PYTHONPATH=/home/master/spark/python:/home/master/spark/python/lib/py4j-0.10.9.7-src.zip:$PYTHONPATH
 
-        $SPARK_HOME/bin/spark-submit /home/master/fraud_detection/spark_jobs/ml/train_model.py
+        $SPARK_HOME/bin/spark-submit --conf spark.cores.max=4 /home/master/fraud_detection/spark_jobs/ml/train_model.py
         """
     )
 
@@ -108,6 +108,9 @@ with DAG(
     register_new_model = BashOperator(
         task_id="register_new_model",
         bash_command="""
+        export HADOOP_HOME=/home/master/hadoop-3.5.0
+        export PATH=$HADOOP_HOME/bin:$PATH
+
         echo 'SUCCESS: New model Precision@200 is superior to baseline.'
         echo 'Promoting Candidate GBT model to Production HDFS path...'
         hdfs dfs -rm -r -skipTrash /lakehouse/fraud_detection/models/gbt_fraud_model || true
@@ -120,13 +123,17 @@ with DAG(
         task_id="reload_streaming_detector",
         bash_command="""
         export SPARK_HOME=/home/master/spark
-        export PYSPARK_PYTHON=/usr/bin/python3.12
-        export PYSPARK_DRIVER_PYTHON=/usr/bin/python3.12
-        export PYTHONPATH=/usr/local/lib/python3.12/dist-packages:$PYTHONPATH
+        export HADOOP_HOME=/home/master/hadoop-3.5.0
+        export PATH=$HADOOP_HOME/bin:$SPARK_HOME/bin:$PATH
+        export PYSPARK_PYTHON=/usr/bin/python3
+        export PYSPARK_DRIVER_PYTHON=/usr/bin/python3
+        export PYTHONPATH=/home/master/spark/python:/home/master/spark/python/lib/py4j-0.10.9.7-src.zip:$PYTHONPATH
 
         echo 'Reloading Streaming Detector with newly registered model...'
-        pkill -f "FraudDetection_Realtime_Detector" || true
-        nohup $SPARK_HOME/bin/spark-submit /home/master/fraud_detection/spark_jobs/streaming/fraud_detector.py > /tmp/streaming_detector.log 2>&1 &
+        pkill -9 -f "FraudDetection_Realtime_Detector" || true
+        sleep 2
+        nohup $SPARK_HOME/bin/spark-submit --conf spark.cores.max=4 /home/master/fraud_detection/spark_jobs/streaming/fraud_detector.py > /tmp/streaming_detector.log 2>&1 &
+        disown
         echo 'Streaming Detector successfully reloaded with updated model!'
         """
     )

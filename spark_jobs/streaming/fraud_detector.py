@@ -1,9 +1,10 @@
 import os
 import sys
+import time
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     from_json, col, to_json, struct, abs as spark_abs, current_timestamp, lit, when, to_timestamp,
-    unix_timestamp, coalesce, count, max as spark_max, sum as spark_sum, countDistinct, avg, stddev, array
+    unix_timestamp, unix_millis, coalesce, count, max as spark_max, sum as spark_sum, countDistinct, avg, stddev, array
 )
 from pyspark.sql.types import (
     StructType, StructField, StringType, DoubleType, IntegerType, TimestampType
@@ -17,19 +18,29 @@ spark = SparkSession.builder \
     .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
     .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
     .config("spark.databricks.delta.schema.autoMerge.enabled", "true") \
+    .config("spark.databricks.delta.optimisticTransaction.conflictRetry.attempts", "5") \
+    .config("spark.databricks.delta.synchronousCheckpoints.enabled", "false") \
+    .config("spark.cores.max", "4") \
     .getOrCreate()
+
 
 spark.sparkContext.setLogLevel("ERROR")
 
 # Configure HDFS paths
 model_path = "/lakehouse/fraud_detection/models/gbt_fraud_model"
+candidate_model_path = "/lakehouse/fraud_detection/models/candidate_gbt_model"
 checkpoint_path = "/lakehouse/fraud_detection/checkpoints/realtime_fraud_detector"
 bronze_transactions_path = "/lakehouse/fraud_detection/bronze/transactions"
 gold_risk_scores_path = "/lakehouse/fraud_detection/gold/risk_scores"
 silver_states_path = "/lakehouse/fraud_detection/silver/customer_states"
 
 print("Loading trained GBT Pipeline Model from HDFS...")
-model = PipelineModel.load(model_path)
+try:
+    model = PipelineModel.load(model_path)
+    print(f"Successfully loaded production model from {model_path}")
+except Exception as e_mod:
+    print(f"Production model not found at {model_path} ({e_mod}). Trying candidate model at {candidate_model_path}...")
+    model = PipelineModel.load(candidate_model_path)
 
 schema = StructType([
     StructField("transaction_id", StringType(), False),
@@ -71,7 +82,16 @@ def process_microbatch(microBatchDF, batchId):
 
     # 1. Stream-Static Join with silver.customer_states for historical features
     if DeltaTable.isDeltaTable(spark, silver_states_path):
-        states_df = spark.read.format("delta").load(silver_states_path)
+        raw_states = spark.read.format("delta").load(silver_states_path)
+        if "account_id" not in raw_states.columns and "source_account" in raw_states.columns:
+            raw_states = raw_states.withColumnRenamed("source_account", "account_id")
+        elif "source_account" in raw_states.columns:
+            raw_states = raw_states.drop("source_account")
+        state_cols = ["account_id"]
+        for c in ["trans_count_total", "total_amount_24h", "avg_amount_30d"]:
+            if c in raw_states.columns:
+                state_cols.append(c)
+        states_df = raw_states.select(*state_cols)
     else:
         states_df = spark.createDataFrame([], StructType([
             StructField("account_id", StringType(), True),
@@ -86,14 +106,19 @@ def process_microbatch(microBatchDF, batchId):
         "left"
     )
 
-    # 2. Compute ML inference features
+    # 2. Compute ML inference features (Matching build_training_set.py logic to prevent Training-Serving Skew)
+    error_dest_expr = when(
+        col("trans_type").isin("TRANSFER", "PAYMENT"),
+        spark_abs((col("old_balance_dest") + col("amount")) - col("new_balance_dest"))
+    ).otherwise(lit(0.0))
+
     features_df = joined_df \
         .withColumn("trans_count_total", coalesce(col("trans_count_total"), lit(0)) + lit(1)) \
         .withColumn("sum_amount_prev", coalesce(col("total_amount_24h"), lit(0.0))) \
         .withColumn("avg_amount_prev", coalesce(col("avg_amount_30d"), col("amount"))) \
         .withColumn("amount_to_avg_ratio", col("amount") / when(col("avg_amount_prev") > 0, col("avg_amount_prev")).otherwise(col("amount"))) \
         .withColumn("error_balance_source", spark_abs((col("old_balance_source") - col("amount")) - col("new_balance_source"))) \
-        .withColumn("error_balance_dest", spark_abs((col("old_balance_dest") + col("amount")) - col("new_balance_dest"))) \
+        .withColumn("error_balance_dest", error_dest_expr) \
         .na.fill({
             "trans_count_total": 1,
             "sum_amount_prev": 0.0,
@@ -116,14 +141,13 @@ def process_microbatch(microBatchDF, batchId):
 
     print(f"[MicroBatch {batchId}] Processed {batch_count} transactions | Fraud Alerts: {fraud_count}")
 
-    # A. Append raw microbatch to bronze.transactions
-    try:
-        microBatchDF.write.format("delta").mode("append").option("mergeSchema", "true").save(bronze_transactions_path)
-    except Exception as e_br:
-        print(f"[Bronze Error] {e_br}")
+
+    # A. Raw transaction ingestion to bronze.transactions is handled by dedicated bronze_ingestion.py job.
+
 
     # B. Append scored records to gold.risk_scores with top risk contribution factors
     try:
+        latency_calc = unix_millis(current_timestamp()) - unix_millis(to_timestamp(col("received_at")))
         gold_df = scored_df.select(
             col("transaction_id"),
             col("source_account"),
@@ -131,12 +155,12 @@ def process_microbatch(microBatchDF, batchId):
             col("trans_type"),
             col("amount"),
             col("channel"),
-            col("timestamp"),
-            col("received_at"),
+            coalesce(col("timestamp").cast("string"), current_timestamp().cast("string")).alias("timestamp"),
+            coalesce(col("received_at").cast("string"), current_timestamp().cast("string")).alias("received_at"),
             col("prob_fraud").cast("double").alias("risk_score"),
             when(col("prediction") == 1.0, lit("PENDING")).otherwise(lit("CLEARED")).alias("inspection_status"),
             lit("GBT_v1.0").alias("model_version"),
-            ((unix_timestamp(current_timestamp()) - unix_timestamp(to_timestamp(col("received_at")))).cast("long") * 1000).alias("latency_ms"),
+            when(latency_calc < lit(0), lit(0)).otherwise(latency_calc).alias("latency_ms"),
             array(
                 struct(lit("amount_to_avg_ratio").alias("name"), col("amount_to_avg_ratio").cast("double").alias("contribution")),
                 struct(lit("error_balance_source").alias("name"), col("error_balance_source").cast("double").alias("contribution")),
@@ -216,8 +240,9 @@ def process_microbatch(microBatchDF, batchId):
                     col("trans_type"),
                     col("amount"),
                     col("channel"),
+                    col("prob_fraud").alias("risk_score"),
                     col("prob_fraud").alias("fraud_probability"),
-                    current_timestamp().alias("alert_generated_at")
+                    current_timestamp().cast("string").alias("alert_generated_at")
                 )).cast("string").alias("value")
             )
 
@@ -232,11 +257,11 @@ def process_microbatch(microBatchDF, batchId):
 
     fraud_alerts_df.unpersist()
 
-print("Starting Structured Streaming Query (trigger 5s)...")
+print("Starting Structured Streaming Query (trigger 10s)...")
 query = parsed_df.writeStream \
     .queryName("Fraud_Detector_ForeachBatch") \
     .option("checkpointLocation", checkpoint_path) \
-    .trigger(processingTime="5 seconds") \
+    .trigger(processingTime="10 seconds") \
     .foreachBatch(process_microbatch) \
     .start()
 

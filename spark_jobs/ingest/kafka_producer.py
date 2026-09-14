@@ -38,20 +38,18 @@ def flush_step_records(records, step):
     # Step 2: Shuffle records to simulate out-of-order data ingestion
     random.shuffle(processed_records)
 
-    # Step 3: Publish records evenly across 4 partitions
-    NUM_PARTITIONS = 4
+    # Step 3: Publish records using key-based hashing (source_account) to guarantee account transaction ordering
     count = 0
     for record in processed_records:
         key = record["source_account"]
-        target_partition = count % NUM_PARTITIONS  # Round-robin distribution
-        producer.send(TOPIC_NAME, key=key, value=record, partition=target_partition)
+        producer.send(TOPIC_NAME, key=key, value=record)
         count += 1
         if count % BATCH_SIZE == 0:
             producer.flush()
             time.sleep(0.05)  # Throttle to prevent broker overload
 
     producer.flush()  # Flush remaining batch
-    print(f"Pushed {len(processed_records)} out-of-order transactions evenly across 4 Partitions (Step {step})")
+    print(f"Pushed {len(processed_records)} out-of-order transactions via key-partitioning (Step {step})")
 
 
 def stream_transactions():

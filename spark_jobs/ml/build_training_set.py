@@ -35,11 +35,16 @@ if DeltaTable.isDeltaTable(spark, inspection_decisions_path):
                  .withColumnRenamed("final_label", "is_fraud_label")
     print("Auditor feedback labels merged successfully into training dataset.")
 
-print("Configuring Point-in-Time Window Function...")
+print("Configuring Point-in-Time & Sliding Window Functions...")
 pit_window = Window.partitionBy("source_account") \
                     .orderBy("timestamp") \
                     .rowsBetween(Window.unboundedPreceding, -1)
 
+# Chuyen timestamp thanh ts_sec (epoch seconds) de tinh cua so thoi gian truot (rangeBetween)
+tx_df = tx_df.withColumn("ts_sec", col("timestamp").cast("timestamp").cast("long"))
+
+w_24h = Window.partitionBy("source_account").orderBy("ts_sec").rangeBetween(-86400, -1)
+w_1h = Window.partitionBy("source_account").orderBy("ts_sec").rangeBetween(-3600, -1)
 
 error_dest_expr = when(
     col("trans_type").isin("TRANSFER", "PAYMENT"),
@@ -50,6 +55,12 @@ tx_with_base_features = tx_df.withColumn(
     "trans_count_total", coalesce(count("transaction_id").over(pit_window), lit(0))
 ).withColumn(
     "sum_amount_prev", coalesce(spark_sum("amount").over(pit_window), lit(0.0))
+).withColumn(
+    "trans_count_24h", coalesce(count("transaction_id").over(w_24h), lit(0))
+).withColumn(
+    "sum_amount_24h", coalesce(spark_sum("amount").over(w_24h), lit(0.0))
+).withColumn(
+    "trans_count_1h", coalesce(count("transaction_id").over(w_1h), lit(0))
 )
 
 feature_store_df = tx_with_base_features.withColumn(
@@ -76,9 +87,13 @@ feature_store_df = tx_with_base_features.withColumn(
     col("sum_amount_prev"),
     col("avg_amount_prev"),
     col("amount_to_avg_ratio"),
+    col("trans_count_24h"),
+    col("sum_amount_24h"),
+    col("trans_count_1h"),
     spark_abs((col("old_balance_source") - col("amount")) - col("new_balance_source")).alias("error_balance_source"),
     error_dest_expr.alias("error_balance_dest")
 )
+
 
 print(f"Saving Point-in-Time Feature Store to HDFS: {features_save_path}")
 feature_store_df.write \
