@@ -46,7 +46,6 @@ schema = StructType([
 # Centralized Environment Configuration
 MASTER_IP = os.getenv("MASTER_IP", "192.168.80.200")
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", f"{MASTER_IP}:9092")
-HDFS_HOST = os.getenv("HDFS_HOST", "labsoe-17")
 
 print(f"--- CONNECTING TO KAFKA BROKER ({KAFKA_BOOTSTRAP_SERVERS}) ---")
 
@@ -57,11 +56,9 @@ kafka_stream_df = spark.readStream \
     .option("startingOffsets", "earliest") \
     .option("failOnDataLoss", "false") \
     .option("kafka.request.timeout.ms", "180000") \
-    .option("kafka.session.timeout.ms", "120000") \
-    .option("kafka.fetch.max.wait.ms", "30000") \
-    .option("maxOffsetsPerTrigger", "3000") \
+    .option("kafka.default.api.timeout.ms", "180000") \
+    .option("maxOffsetsPerTrigger", "2000") \
     .load()
-
 
 from pyspark.sql.functions import from_json, col, coalesce, current_timestamp, to_timestamp
 
@@ -72,26 +69,20 @@ parsed_stream_df = kafka_stream_df.selectExpr("CAST(value AS STRING) as json_pay
     .withColumn("timestamp", coalesce(to_timestamp(col("timestamp")), current_timestamp())) \
     .withColumn("partition_date", col("timestamp").cast(DateType()))
 
+BRONZE_PATH = "hdfs:///lakehouse/fraud_detection/bronze"
+CHECKPOINT_PATH = "/lakehouse/fraud_detection/checkpoints/bronze_ingest"
 
-
-
-bronze_table_path = f"hdfs://{HDFS_HOST}:9000/lakehouse/fraud_detection/bronze"
-checkpoint_hdfs_path = f"hdfs://{HDFS_HOST}:9000/lakehouse/fraud_detection/checkpoints/bronze_ingest"
-
-
-
-print(f"--- STREAMING DATA WRITING TO BRONZE DELTA LAKE: {bronze_table_path} ---")
+print(f"--- STREAMING DATA WRITING TO BRONZE DELTA LAKE: {BRONZE_PATH} ---")
 
 query = parsed_stream_df.writeStream \
     .queryName("Bronze_Kafka_Ingestion") \
     .format("delta") \
     .outputMode("append") \
     .partitionBy("partition_date") \
-    .option("checkpointLocation", checkpoint_hdfs_path) \
+    .option("checkpointLocation", CHECKPOINT_PATH) \
     .option("mergeSchema", "true") \
-    .trigger(processingTime="5 seconds") \
-    .start(bronze_table_path)
-
+    .trigger(processingTime="10 seconds") \
+    .start(BRONZE_PATH)
 
 query.awaitTermination()
 

@@ -4,7 +4,6 @@ import time
 import random
 from datetime import datetime, timedelta
 from kafka import KafkaProducer
-
 import os
 
 # Configuration (Centralized Environment Variables)
@@ -13,8 +12,15 @@ KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", f"{MASTER_IP}:909
 TOPIC_NAME = os.getenv("KAFKA_TOPIC", "transactions")
 CSV_FILE_PATH = os.getenv("CSV_FILE_PATH", "/home/master/PS_20174392719_1491204439457_log.csv")
 
-CHANNELS = ["ATM", "POS", "ONLINE", "APP"]
-BATCH_SIZE = 100  # Number of records per batch before flush
+CHANNEL_MAP = {
+    "CASH_OUT": "ATM",
+    "TRANSFER": "ONLINE",
+    "PAYMENT":  "POS",
+    "CASH_IN":  "APP",
+    "DEBIT":    "POS",
+}
+
+BATCH_SIZE = 100
 
 producer = KafkaProducer(
     bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
@@ -51,7 +57,6 @@ def flush_step_records(records, step):
     producer.flush()  # Flush remaining batch
     print(f"Pushed {len(processed_records)} out-of-order transactions via key-partitioning (Step {step})")
 
-
 def stream_transactions():
     print("Starting Advanced Kafka Producer (Watermark Simulation Mode)...")
 
@@ -72,7 +77,7 @@ def stream_transactions():
                 "new_balance_source": float(row["newbalanceOrig"]),
                 "old_balance_dest": float(row["oldbalanceDest"]),
                 "new_balance_dest": float(row["newbalanceDest"]),
-                "channel": random.choice(CHANNELS),
+                "channel": CHANNEL_MAP.get(row["type"], "ONLINE"),
                 "is_fraud_label": int(row["isFraud"])
             }
 
@@ -82,14 +87,11 @@ def stream_transactions():
                 flush_step_records(step_records, current_step)
                 current_step = step
                 step_records = [record]
-                time.sleep(10)  # Compress 1 simulation hour into 10 seconds real-time
-
+                time.sleep(10)
 
         # Process final step
         if step_records:
             flush_step_records(step_records, current_step)
-
-
 
 if __name__ == "__main__":
     stream_transactions()

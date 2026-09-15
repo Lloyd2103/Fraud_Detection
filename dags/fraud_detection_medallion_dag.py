@@ -34,7 +34,17 @@ def check_label_count_gate():
         return "skip_insufficient_labels"
 
 def compare_model_precision():
-    # So sanh Precision@200 giua model ung vien va baseline dang chay
+    # So sanh Precision@200 giua model ung vien va baseline dang chay (Doc tu HDFS Delta status)
+    try:
+        cmd = ["hdfs", "dfs", "-cat", "/lakehouse/fraud_detection/models/_eval_status/_delta_log/00000000000000000000.json"]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if "worse" in res.stdout:
+            return "keep_current_model"
+        elif "better" in res.stdout:
+            return "register_new_model"
+    except Exception:
+        pass
+
     eval_file = "/tmp/model_eval_status"
     if os.path.exists(eval_file):
         with open(eval_file, "r") as f:
@@ -44,7 +54,6 @@ def compare_model_precision():
             elif status == "better":
                 return "register_new_model"
 
-    # Default to register new model if candidate precision met baseline criteria
     return "register_new_model"
 
 with DAG(

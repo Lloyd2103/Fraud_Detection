@@ -21,10 +21,10 @@ spark = SparkSession.builder \
 
 spark.sparkContext.setLogLevel("ERROR")
 
-kafka_bootstrap_servers = "192.168.80.200:9092"
-input_topic = "transactions"
-silver_states_path = "hdfs:///lakehouse/fraud_detection/silver/customer_states"
-checkpoint_path = "hdfs:///lakehouse/fraud_detection/checkpoints/update_customer_states"
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "192.168.80.200:9092")
+INPUT_TOPIC = "transactions"
+SILVER_STATES = "hdfs:///lakehouse/fraud_detection/silver/customer_states"
+CHECKPOINT_PATH = "hdfs:///lakehouse/fraud_detection/checkpoints/update_customer_states"
 
 schema = StructType([
     StructField("transaction_id", StringType(), False),
@@ -41,11 +41,11 @@ schema = StructType([
     StructField("timestamp", StringType(), True)
 ])
 
-print(f"[INFO] Subscribing to Kafka topic '{input_topic}' for state maintenance...")
+print(f"[INFO] Subscribing to Kafka topic '{INPUT_TOPIC}' for state maintenance...")
 kafka_stream_df = spark.readStream \
     .format("kafka") \
-    .option("kafka.bootstrap.servers", kafka_bootstrap_servers) \
-    .option("subscribe", input_topic) \
+    .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS) \
+    .option("subscribe", INPUT_TOPIC) \
     .option("startingOffsets", "latest") \
     .option("failOnDataLoss", "false") \
     .load()
@@ -72,8 +72,8 @@ def update_states_microbatch(microBatchDF, batchId):
             countDistinct("dest_account").alias("b_dest_count")
         ).withColumnRenamed("source_account", "account_id")
 
-        if DeltaTable.isDeltaTable(spark, silver_states_path):
-            deltaTable = DeltaTable.forPath(spark, silver_states_path)
+        if DeltaTable.isDeltaTable(spark, SILVER_STATES):
+            deltaTable = DeltaTable.forPath(spark, SILVER_STATES)
             deltaTable.alias("target").merge(
                 batch_states.alias("source"),
                 "target.account_id = source.account_id"
@@ -120,7 +120,7 @@ def update_states_microbatch(microBatchDF, batchId):
                 col("b_last_balance").alias("last_known_balance"),
                 current_timestamp().alias("updated_at")
             )
-            init_df.write.format("delta").mode("overwrite").save(silver_states_path)
+            init_df.write.format("delta").mode("overwrite").save(SILVER_STATES)
             print(f"[Stateful Batch {batchId}] Initialized Delta Table Silver States.")
     except Exception as e_state:
         print(f"[Stateful Batch {batchId}] State Update Error: {e_state}")
@@ -128,7 +128,7 @@ def update_states_microbatch(microBatchDF, batchId):
 state_query = parsed_stream_df.writeStream \
     .queryName("Customer_States_Aggregator") \
     .trigger(processingTime="10 seconds") \
-    .option("checkpointLocation", checkpoint_path) \
+    .option("checkpointLocation", CHECKPOINT_PATH) \
     .foreachBatch(update_states_microbatch) \
     .start()
 

@@ -1,13 +1,14 @@
 import os
-import sys
-import time
 from pyspark.sql import SparkSession
+from pyspark.sql.window import Window
 from pyspark.sql.functions import (
-    from_json, col, to_json, struct, abs as spark_abs, current_timestamp, lit, when, to_timestamp,
-    unix_timestamp, unix_millis, coalesce, count, max as spark_max, sum as spark_sum, countDistinct, avg, stddev, array
+    from_json, col, to_json, struct, abs as spark_abs,
+    current_timestamp, lit, when, to_timestamp,
+    unix_millis, coalesce, count, max as spark_max,
+    sum as spark_sum, avg as spark_avg, desc
 )
 from pyspark.sql.types import (
-    StructType, StructField, StringType, DoubleType, IntegerType, TimestampType
+    StructType, StructField, StringType, DoubleType, IntegerType
 )
 from pyspark.ml import PipelineModel
 from pyspark.ml.functions import vector_to_array
@@ -19,28 +20,24 @@ spark = SparkSession.builder \
     .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
     .config("spark.databricks.delta.schema.autoMerge.enabled", "true") \
     .config("spark.databricks.delta.optimisticTransaction.conflictRetry.attempts", "5") \
-    .config("spark.databricks.delta.synchronousCheckpoints.enabled", "false") \
-    .config("spark.cores.max", "4") \
     .getOrCreate()
 
+spark.sparkContext.setLogLevel("WARN")
 
-spark.sparkContext.setLogLevel("ERROR")
+MODEL_PATH        = "hdfs:///lakehouse/fraud_detection/models/gbt_fraud_model"
+CANDIDATE_PATH    = "hdfs:///lakehouse/fraud_detection/models/candidate_gbt_model"
+CHECKPOINT_PATH   = "hdfs:///lakehouse/fraud_detection/checkpoints/realtime_fraud_detector"
+SILVER_STATES     = "hdfs:///lakehouse/fraud_detection/silver/customer_states"
+GOLD_RISK_SCORES  = "hdfs:///lakehouse/fraud_detection/gold/risk_scores"
+KAFKA_BROKERS     = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "192.168.80.200:9092")
 
-# Configure HDFS paths
-model_path = "/lakehouse/fraud_detection/models/gbt_fraud_model"
-candidate_model_path = "/lakehouse/fraud_detection/models/candidate_gbt_model"
-checkpoint_path = "/lakehouse/fraud_detection/checkpoints/realtime_fraud_detector"
-bronze_transactions_path = "/lakehouse/fraud_detection/bronze/transactions"
-gold_risk_scores_path = "/lakehouse/fraud_detection/gold/risk_scores"
-silver_states_path = "/lakehouse/fraud_detection/silver/customer_states"
-
-print("Loading trained GBT Pipeline Model from HDFS...")
+print("Loading trained GBT Pipeline Model...")
 try:
-    model = PipelineModel.load(model_path)
-    print(f"Successfully loaded production model from {model_path}")
-except Exception as e_mod:
-    print(f"Production model not found at {model_path} ({e_mod}). Trying candidate model at {candidate_model_path}...")
-    model = PipelineModel.load(candidate_model_path)
+    model = PipelineModel.load(MODEL_PATH)
+    print(f"Loaded production model from {MODEL_PATH}")
+except Exception as e:
+    print(f"Production model unavailable ({e}), loading candidate.")
+    model = PipelineModel.load(CANDIDATE_PATH)
 
 schema = StructType([
     StructField("transaction_id", StringType(), False),
@@ -59,208 +56,208 @@ schema = StructType([
     StructField("partition_date", StringType(), True)
 ])
 
-print("Reading real-time transaction stream from Kafka...")
 kafka_stream_df = spark.readStream \
     .format("kafka") \
-    .option("kafka.bootstrap.servers", "192.168.80.200:9092") \
+    .option("kafka.bootstrap.servers", KAFKA_BROKERS) \
     .option("subscribe", "transactions") \
     .option("startingOffsets", "latest") \
     .option("failOnDataLoss", "false") \
     .load()
 
-parsed_df = kafka_stream_df.selectExpr("CAST(value AS STRING) as json_payload") \
-    .select(from_json(col("json_payload"), schema).alias("data")) \
-    .select("data.*") \
+parsed_df = kafka_stream_df \
+    .select(
+        col("timestamp").alias("kafka_ts_ms"), 
+        col("value").cast("string").alias("json_payload")
+    ) \
+    .select(
+        col("kafka_ts_ms"),
+        from_json(col("json_payload"), schema).alias("data")
+    ) \
+    .select("kafka_ts_ms", "data.*") \
     .withColumn("event_time", to_timestamp(col("timestamp"))) \
     .withWatermark("event_time", "1 minute")
 
-def process_microbatch(microBatchDF, batchId):
-    if microBatchDF.rdd.isEmpty():
+
+def process_microbatch(micro_batch_df, batch_id):
+    if micro_batch_df.rdd.isEmpty():
         return
 
-    batch_count = microBatchDF.count()
+    batch_size = micro_batch_df.count()
 
-    # 1. Stream-Static Join with silver.customer_states for historical features
-    if DeltaTable.isDeltaTable(spark, silver_states_path):
-        raw_states = spark.read.format("delta").load(silver_states_path)
-        if "account_id" not in raw_states.columns and "source_account" in raw_states.columns:
-            raw_states = raw_states.withColumnRenamed("source_account", "account_id")
-        elif "source_account" in raw_states.columns:
-            raw_states = raw_states.drop("source_account")
-        state_cols = ["account_id"]
-        for c in ["trans_count_total", "total_amount_24h", "avg_amount_30d"]:
-            if c in raw_states.columns:
-                state_cols.append(c)
-        states_df = raw_states.select(*state_cols)
+    # 1. Load state TRƯỚC khi update — đây là điểm mấu chốt để tránh
+    if DeltaTable.isDeltaTable(spark, SILVER_STATES):
+        states_df = spark.read.format("delta").load(SILVER_STATES).select(
+            col("account_id"),
+            col("trans_count_total").alias("s_trans_count_total"),
+            col("sum_amount_history").alias("s_sum_amount_prev"),
+            col("avg_amount_history").alias("s_avg_amount_prev"),
+            col("tx_count_24h").alias("s_trans_count_24h"),
+            col("total_amount_24h").alias("s_sum_amount_24h"),
+            col("tx_count_1h").alias("s_trans_count_1h")
+        )
     else:
         states_df = spark.createDataFrame([], StructType([
             StructField("account_id", StringType(), True),
-            StructField("trans_count_total", IntegerType(), True),
-            StructField("total_amount_24h", DoubleType(), True),
-            StructField("avg_amount_30d", DoubleType(), True)
+            StructField("s_trans_count_total", IntegerType(), True),
+            StructField("s_sum_amount_prev", DoubleType(), True),
+            StructField("s_avg_amount_prev", DoubleType(), True),
+            StructField("s_trans_count_24h", IntegerType(), True),
+            StructField("s_sum_amount_24h", DoubleType(), True),
+            StructField("s_trans_count_1h", IntegerType(), True)
         ]))
 
-    joined_df = microBatchDF.join(
+    joined = micro_batch_df.join(
         states_df,
-        microBatchDF.source_account == states_df.account_id,
+        micro_batch_df.source_account == states_df.account_id,
         "left"
     )
 
-    # 2. Compute ML inference features (Matching build_training_set.py logic to prevent Training-Serving Skew)
+
+    # 2. Feature engineering — PHẢI khớp build_training_set.py
+
     error_dest_expr = when(
         col("trans_type").isin("TRANSFER", "PAYMENT"),
         spark_abs((col("old_balance_dest") + col("amount")) - col("new_balance_dest"))
     ).otherwise(lit(0.0))
 
-    features_df = joined_df \
-        .withColumn("trans_count_total", coalesce(col("trans_count_total"), lit(0)) + lit(1)) \
-        .withColumn("sum_amount_prev", coalesce(col("total_amount_24h"), lit(0.0))) \
-        .withColumn("avg_amount_prev", coalesce(col("avg_amount_30d"), col("amount"))) \
-        .withColumn("amount_to_avg_ratio", col("amount") / when(col("avg_amount_prev") > 0, col("avg_amount_prev")).otherwise(col("amount"))) \
-        .withColumn("error_balance_source", spark_abs((col("old_balance_source") - col("amount")) - col("new_balance_source"))) \
+    features_df = joined \
+        .withColumn("trans_count_total", coalesce(col("s_trans_count_total"), lit(0))) \
+        .withColumn("sum_amount_prev",  coalesce(col("s_sum_amount_prev"),  lit(0.0))) \
+        .withColumn("avg_amount_prev",
+            when(col("trans_count_total") > 0, col("sum_amount_prev") / col("trans_count_total"))
+            .otherwise(lit(0.0))
+        ) \
+        .withColumn("amount_to_avg_ratio",
+            when(col("avg_amount_prev") > 0, col("amount") / col("avg_amount_prev"))
+            .otherwise(lit(1.0))
+        ) \
+        .withColumn("trans_count_24h", coalesce(col("s_trans_count_24h"), lit(0))) \
+        .withColumn("sum_amount_24h",  coalesce(col("s_sum_amount_24h"),  lit(0.0))) \
+        .withColumn("trans_count_1h",  coalesce(col("s_trans_count_1h"),  lit(0))) \
+        .withColumn("error_balance_source",
+            spark_abs((col("old_balance_source") - col("amount")) - col("new_balance_source"))
+        ) \
         .withColumn("error_balance_dest", error_dest_expr) \
         .na.fill({
-            "trans_count_total": 1,
-            "sum_amount_prev": 0.0,
-            "avg_amount_prev": 0.0,
-            "amount_to_avg_ratio": 1.0,
-            "error_balance_source": 0.0,
-            "error_balance_dest": 0.0,
-            "old_balance_source": 0.0,
-            "new_balance_source": 0.0,
-            "old_balance_dest": 0.0,
-            "new_balance_dest": 0.0
+            "amount": 0.0,
+            "old_balance_source": 0.0, "new_balance_source": 0.0,
+            "old_balance_dest": 0.0,   "new_balance_dest": 0.0,
+            "trans_type": "UNKNOWN",   "channel": "UNKNOWN"
         })
 
-    # 3. Execute ML Inference
-    scored_df = model.transform(features_df) \
-        .withColumn("prob_fraud", vector_to_array(col("probability"))[1])
+    # 3. Inference
+    scored = model.transform(features_df) \
+        .withColumn("prob_fraud", vector_to_array(col("probability"))[1]) \
+        .withColumn("scored_at", current_timestamp())
 
-    fraud_alerts_df = scored_df.filter(col("prediction") == 1.0).cache()
-    fraud_count = fraud_alerts_df.count()
+    fraud_alerts = scored.filter(col("prediction") == 1.0).cache()
+    fraud_count = fraud_alerts.count()
+    print(f"[MicroBatch {batch_id}] processed {batch_size} | fraud alerts {fraud_count}")
 
-    print(f"[MicroBatch {batchId}] Processed {batch_count} transactions | Fraud Alerts: {fraud_count}")
+    # 4. Write gold.risk_scores
+    gold_df = scored.select(
+        col("transaction_id"),
+        col("source_account"),
+        col("dest_account"),
+        col("trans_type"),
+        col("amount"),
+        col("channel"),
+        col("event_time").alias("timestamp"),
+        col("received_at"),
+        col("prob_fraud").cast("double").alias("risk_score"),
+        when(col("prediction") == 1.0, lit("PENDING")).otherwise(lit("CLEARED")).alias("inspection_status"),
+        lit("GBT_v1.0").alias("model_version"),
+        (unix_millis(col("scored_at")) - col("kafka_ts_ms")).cast("long").alias("latency_ms"),
+        struct(
+            lit("amount_to_avg_ratio").alias("name"),
+            (col("amount_to_avg_ratio") - lit(1.0)).cast("double").alias("contribution")
+        ).alias("f_amount_ratio"),
+        struct(
+            lit("error_balance_source").alias("name"),
+            col("error_balance_source").cast("double").alias("contribution")
+        ).alias("f_err_src"),
+        struct(
+            lit("error_balance_dest").alias("name"),
+            col("error_balance_dest").cast("double").alias("contribution")
+        ).alias("f_err_dst"),
+        col("scored_at")
+    ).select(
+        "*",
+        struct(col("f_amount_ratio"), col("f_err_src"), col("f_err_dst")).alias("top_risk_factors")
+    ).drop("f_amount_ratio", "f_err_src", "f_err_dst")
 
+    gold_df.write.format("delta").mode("append") \
+        .option("mergeSchema", "true") \
+        .save(GOLD_RISK_SCORES)
 
-    # A. Raw transaction ingestion to bronze.transactions is handled by dedicated bronze_ingestion.py job.
+    # 5. Update state SAU khi đã score (đảm bảo point-in-time cho batch sau)
 
+    batch_stats = micro_batch_df.groupBy("source_account").agg(
+        count("transaction_id").alias("b_count"),
+        spark_sum("amount").alias("b_sum"),
+        spark_max("event_time").alias("b_last_time"),
+        spark_max("new_balance_source").alias("b_last_balance")
+    ).withColumnRenamed("source_account", "account_id")
 
-    # B. Append scored records to gold.risk_scores with top risk contribution factors
-    try:
-        latency_calc = unix_millis(current_timestamp()) - unix_millis(to_timestamp(col("received_at")))
-        gold_df = scored_df.select(
-            col("transaction_id"),
-            col("source_account"),
-            col("dest_account"),
-            col("trans_type"),
-            col("amount"),
-            col("channel"),
-            coalesce(col("timestamp").cast("string"), current_timestamp().cast("string")).alias("timestamp"),
-            coalesce(col("received_at").cast("string"), current_timestamp().cast("string")).alias("received_at"),
-            col("prob_fraud").cast("double").alias("risk_score"),
-            when(col("prediction") == 1.0, lit("PENDING")).otherwise(lit("CLEARED")).alias("inspection_status"),
-            lit("GBT_v1.0").alias("model_version"),
-            when(latency_calc < lit(0), lit(0)).otherwise(latency_calc).alias("latency_ms"),
-            array(
-                struct(lit("amount_to_avg_ratio").alias("name"), col("amount_to_avg_ratio").cast("double").alias("contribution")),
-                struct(lit("error_balance_source").alias("name"), col("error_balance_source").cast("double").alias("contribution")),
-                struct(lit("error_balance_dest").alias("name"), col("error_balance_dest").cast("double").alias("contribution"))
-            ).alias("top_risk_factors"),
-            current_timestamp().alias("scored_at")
-        )
-        gold_df.write.format("delta").mode("append").option("mergeSchema", "true").save(gold_risk_scores_path)
-    except Exception as e_gold:
-        print(f"[Gold Error] {e_gold}")
+    if DeltaTable.isDeltaTable(spark, SILVER_STATES):
+        delta_t = DeltaTable.forPath(spark, SILVER_STATES)
+        delta_t.alias("t").merge(
+            batch_stats.alias("s"),
+            "t.account_id = s.account_id"
+        ).whenMatchedUpdate(set={
+            "trans_count_total": col("t.trans_count_total") + col("s.b_count"),
+            "sum_amount_history": col("t.sum_amount_history") + col("s.b_sum"),
+            "avg_amount_history": (col("t.sum_amount_history") + col("s.b_sum")) /
+                                  (col("t.trans_count_total") + col("s.b_count")),
+            "tx_count_1h":  col("t.tx_count_1h")  + col("s.b_count"),
+            "tx_count_24h": col("t.tx_count_24h") + col("s.b_count"),
+            "tx_count_7d":  col("t.tx_count_7d")  + col("s.b_count"),
+            "total_amount_24h": col("t.total_amount_24h") + col("s.b_sum"),
+            "last_active_time": col("s.b_last_time"),
+            "last_known_balance": col("s.b_last_balance"),
+            "updated_at": current_timestamp()
+        }).whenNotMatchedInsert(values={
+            "account_id": col("s.account_id"),
+            "trans_count_total": col("s.b_count"),
+            "sum_amount_history": col("s.b_sum"),
+            "avg_amount_history": col("s.b_sum") / col("s.b_count"),
+            "stddev_amount_history": lit(0.0),
+            "unique_dest_accounts": lit(1),
+            "tx_count_1h":  col("s.b_count"),
+            "tx_count_24h": col("s.b_count"),
+            "tx_count_7d":  col("s.b_count"),
+            "total_amount_24h": col("s.b_sum"),
+            "frequent_tx_hours": lit(None).cast("array<int>"),
+            "last_active_time": col("s.b_last_time"),
+            "last_known_balance": col("s.b_last_balance"),
+            "updated_at": current_timestamp()
+        }).execute()
 
-    # C. Delta MERGE account state aggregates into silver.customer_states
-    try:
-        batch_stats = microBatchDF.groupBy("source_account").agg(
-            count("transaction_id").alias("b_tx_count"),
-            spark_sum("amount").alias("b_sum_amount"),
-            spark_max("event_time").alias("b_last_time"),
-            spark_max("new_balance_source").alias("b_last_balance")
-        ).withColumnRenamed("source_account", "account_id")
-
-        if DeltaTable.isDeltaTable(spark, silver_states_path):
-            deltaTable = DeltaTable.forPath(spark, silver_states_path)
-            deltaTable.alias("target").merge(
-                batch_stats.alias("source"),
-                "target.account_id = source.account_id"
-            ).whenMatchedUpdate(set={
-                "tx_count_24h": col("target.tx_count_24h") + col("source.b_tx_count"),
-                "trans_count_total": col("target.trans_count_total") + col("source.b_tx_count"),
-                "total_amount_24h": col("target.total_amount_24h") + col("source.b_sum_amount"),
-                "last_active_time": col("source.b_last_time"),
-                "last_known_balance": col("source.b_last_balance"),
-                "updated_at": current_timestamp()
-            }).whenNotMatchedInsert(values={
-                "account_id": col("source.account_id"),
-                "tx_count_1h": col("source.b_tx_count"),
-                "tx_count_24h": col("source.b_tx_count"),
-                "tx_count_7d": col("source.b_tx_count"),
-                "trans_count_total": col("source.b_tx_count"),
-                "total_amount_24h": col("source.b_sum_amount"),
-                "avg_amount_30d": col("source.b_sum_amount") / col("source.b_tx_count"),
-                "stddev_amount_30d": lit(0.0),
-                "unique_dest_accounts_24h": lit(1),
-                "frequent_tx_hours": array(lit(8), lit(12), lit(20)),
-                "last_active_time": col("source.b_last_time"),
-                "last_known_balance": col("source.b_last_balance"),
-                "updated_at": current_timestamp()
-            }).execute()
-        else:
-            init_df = batch_stats.select(
-                col("account_id"),
-                col("b_tx_count").alias("tx_count_1h"),
-                col("b_tx_count").alias("tx_count_24h"),
-                col("b_tx_count").alias("tx_count_7d"),
-                col("b_tx_count").alias("trans_count_total"),
-                col("b_sum_amount").alias("total_amount_24h"),
-                (col("b_sum_amount") / col("b_tx_count")).alias("avg_amount_30d"),
-                lit(0.0).alias("stddev_amount_30d"),
-                lit(1).alias("unique_dest_accounts_24h"),
-                array(lit(8), lit(12), lit(20)).alias("frequent_tx_hours"),
-                col("b_last_time").alias("last_active_time"),
-                col("b_last_balance").alias("last_known_balance"),
-                current_timestamp().alias("updated_at")
-            )
-            init_df.write.format("delta").mode("overwrite").save(silver_states_path)
-    except Exception as e_merge:
-        print(f"[Merge Error] {e_merge}")
-
-    # D. Publish alerts to Kafka topic 'alerts'
+    # 6. Publish alerts to Kafka
     if fraud_count > 0:
-        try:
-            kafka_payload = fraud_alerts_df.select(
-                col("transaction_id").cast("string").alias("key"),
-                to_json(struct(
-                    col("transaction_id"),
-                    col("source_account"),
-                    col("dest_account"),
-                    col("trans_type"),
-                    col("amount"),
-                    col("channel"),
-                    col("prob_fraud").alias("risk_score"),
-                    col("prob_fraud").alias("fraud_probability"),
-                    current_timestamp().cast("string").alias("alert_generated_at")
-                )).cast("string").alias("value")
-            )
+        alert_payload = fraud_alerts.select(
+            col("transaction_id").cast("string").alias("key"),
+            to_json(struct(
+                col("transaction_id"),
+                col("source_account"),
+                col("dest_account"),
+                col("trans_type"),
+                col("amount"),
+                col("prob_fraud").alias("risk_score")
+            )).cast("string").alias("value")
+        )
+        alert_payload.write \
+            .format("kafka") \
+            .option("kafka.bootstrap.servers", KAFKA_BROKERS) \
+            .option("topic", "alerts") \
+            .save()
 
-            kafka_payload.write \
-                .format("kafka") \
-                .option("kafka.bootstrap.servers", "192.168.80.200:9092") \
-                .option("topic", "alerts") \
-                .save()
-            print(f"   [Kafka] Successfully published {fraud_count} fraud alerts to topic 'alerts'")
-        except Exception as e_kafka:
-            print(f"[Kafka Error] {e_kafka}")
+    fraud_alerts.unpersist()
 
-    fraud_alerts_df.unpersist()
 
-print("Starting Structured Streaming Query (trigger 10s)...")
 query = parsed_df.writeStream \
     .queryName("Fraud_Detector_ForeachBatch") \
-    .option("checkpointLocation", checkpoint_path) \
+    .option("checkpointLocation", CHECKPOINT_PATH) \
     .trigger(processingTime="10 seconds") \
     .foreachBatch(process_microbatch) \
     .start()

@@ -30,10 +30,7 @@ def main():
         tp = TopicPartition(topic_name, 0)
         consumer.assign([tp])
 
-        # Lay tong so records hien tai
         end_offset = consumer.end_offsets([tp])[tp]
-        
-        # Doc 15 ban ghi gan nhat truoc khi bat dau stream realtime
         start_offset = max(0, end_offset - 15)
         consumer.seek(tp, start_offset)
 
