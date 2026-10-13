@@ -2,76 +2,68 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.providers.standard.operators.bash import BashOperator
 from airflow.providers.standard.operators.python import BranchPythonOperator
-from deltalake import DeltaTable
 
 default_args = {
-    "owner": "master",
+    "owner": "airflow",
     "depends_on_past": False,
+    "start_date": datetime(2026, 8, 1),
+    "email_on_failure": False,
+    "email_on_retry": False,
     "retries": 1,
-    "retry_delay": timedelta(minutes=5),
+    "retry_delay": timedelta(minutes=3),
 }
 
-STATUS_PATH = "hdfs:///lakehouse/fraud_detection/models/_eval_status"
-
-
-def check_eval_status():
-    try:
-        dt = DeltaTable(STATUS_PATH)
-        df = dt.to_pandas()
-        decision = df["decision"].iloc[0]
-    except Exception:
-        return "keep_current_model"
-
-    return "promote_model" if decision == "better" else "keep_current_model"
-
-
 with DAG(
-    dag_id="model_retraining_dag",
+    dag_id="training_model",
     default_args=default_args,
-    description="Weekly retraining with point-in-time join",
-    schedule="0 3 * * 0",
-    start_date=datetime(2026, 1, 1),
+    description="Training Model, PIT Features",
+    schedule="0 3 * * 1",  # Weekly run at 03:00 Monday
     catchup=False,
-    tags=["ml", "training", "lakehouse"],
+    max_active_runs=1,
+    tags=["training", "mlops", "point-in-time", "gbt"],
 ) as dag:
 
-    build_training_set = BashOperator(
-        task_id="build_training_set",
+    # 1. Medallion Ingestion: Bronze to Silver
+    bronze_to_silver = BashOperator(
+        task_id="transform_bronze_to_silver",
         bash_command="""
-        export SPARK_HOME=/home/master/spark
+        export SPARK_HOME=/home/fraud/spark
         $SPARK_HOME/bin/spark-submit \
-            --packages io.delta:delta-spark_2.12:3.1.0 \
-            --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
-            --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
-            /home/master/fraud_detection/spark_jobs/ml/build_training_set.py
-        """,
+          /home/fraud/fraud_detection/spark_jobs/transform/bronze_to_silver.py --full
+        """
     )
 
+    # 2. Medallion Aggregations: Silver to Gold
+    silver_to_gold = BashOperator(
+        task_id="transform_silver_to_gold",
+        bash_command="""
+        export SPARK_HOME=/home/fraud/spark
+        $SPARK_HOME/bin/spark-submit \
+          /home/fraud/fraud_detection/spark_jobs/transform/silver_to_gold.py
+        """
+    )
+
+    # 4. Point-in-Time Feature Store (No Data Leakage)
+    build_pit_features = BashOperator(
+        task_id="build_pit_features",
+        bash_command="""
+        export SPARK_HOME=/home/fraud/spark
+        $SPARK_HOME/bin/spark-submit \
+          /home/fraud/fraud_detection/spark_jobs/ml/build_training_set.py
+        """
+    )
+
+    # 6. Multi-Model Training & Precision@200 Evaluation
     train_model = BashOperator(
-        task_id="train_model",
+        task_id="train_ml_model",
+        trigger_rule="one_success",
         bash_command="""
-        export SPARK_HOME=/home/master/spark
+        export SPARK_HOME=/home/fraud/spark
         $SPARK_HOME/bin/spark-submit \
-            --packages io.delta:delta-spark_2.12:3.1.0 \
-            --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
-            --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
-            /home/master/fraud_detection/spark_jobs/ml/train_model.py
-        """,
+          /home/fraud/fraud_detection/spark_jobs/ml/train_model.py
+        """
     )
 
-    branch = BranchPythonOperator(
-        task_id="branch_model_promotion",
-        python_callable=check_eval_status,
-    )
-
-    promote_model = BashOperator(
-        task_id="promote_model",
-        bash_command="echo 'Model promoted to production.'",
-    )
-
-    keep_current = BashOperator(
-        task_id="keep_current_model",
-        bash_command="echo 'Keeping current model.'",
-    )
-
-    build_training_set >> train_model >> branch >> [promote_model, keep_current]
+    # === WORKFLOW DEPENDENCY MAP ===
+    bronze_to_silver >> silver_to_gold >> build_pit_features >> train_model 
+    

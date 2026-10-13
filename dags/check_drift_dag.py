@@ -79,13 +79,13 @@ with DAG(
     compute_psi_ks = BashOperator(
         task_id="compute_psi_ks",
         bash_command="""
-        export SPARK_HOME=/home/master/spark
+        export SPARK_HOME=/home/fraud/spark
         $SPARK_HOME/bin/spark-submit \
             --packages io.delta:delta-spark_2.12:3.1.0 \
             --conf spark.cores.max=4 \
             --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
             --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
-            /home/master/fraud_detection/spark_jobs/ml/check_data_drift.py
+            /home/fraud/fraud_detection/spark_jobs/ml/check_data_drift.py
         """,
         retries=2,
     )
@@ -112,7 +112,7 @@ with DAG(
 
     trigger_retraining_dag = TriggerDagRunOperator(
         task_id="trigger_retraining_dag",
-        trigger_dag_id="model_retraining_dag",
+        trigger_dag_id="fraud_retraining_dag",
     )
 
     compute_psi_ks >> branch_operator >> [

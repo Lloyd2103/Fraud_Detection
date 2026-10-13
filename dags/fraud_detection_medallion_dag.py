@@ -13,15 +13,13 @@ default_args = {
     "email_on_retry": False,
     "retries": 1,
     "retry_delay": timedelta(minutes=5),
-    "sla": timedelta(hours=2),  # Essential SLA criteria (A.6 requirement)
+    "sla": timedelta(hours=2),
 }
 
 def check_label_count_gate():
-    # Kiem tra so luong nhan moi tu tham dinh vien (toi thieu 500 nhan moi de retrain)
-    # Lightweight check to avoid JVM RAM bloat inside Airflow Worker
     try:
         import subprocess
-        cmd = ["/home/master/hadoop-3.5.0/bin/hdfs", "dfs", "-test", "-e", "/lakehouse/fraud_detection/silver/inspection_decisions/_delta_log"]
+        cmd = ["/home/fraud/hadoop-3.5.0/bin/hdfs", "dfs", "-test", "-e", "/lakehouse/fraud_detection/silver/inspection_decisions/_delta_log"]
         res = subprocess.run(cmd, capture_output=True)
         if res.returncode == 0:
             print("Inspection decision Delta table exists on HDFS. Proceeding with retraining pipeline.")
@@ -34,7 +32,6 @@ def check_label_count_gate():
         return "skip_insufficient_labels"
 
 def compare_model_precision():
-    # So sanh Precision@200 giua model ung vien va baseline dang chay (Doc tu HDFS Delta status)
     try:
         cmd = ["hdfs", "dfs", "-cat", "/lakehouse/fraud_detection/models/_eval_status/_delta_log/00000000000000000000.json"]
         res = subprocess.run(cmd, capture_output=True, text=True)
@@ -66,7 +63,24 @@ with DAG(
     tags=["mlops", "training", "lakehouse"],
 ) as dag:
 
-    # 1. Kiem tra nguong 500 nhan
+    sync_feedback_to_delta = BashOperator(
+        task_id="sync_feedback_to_delta",
+        bash_command="""
+        export SPARK_HOME=/home/fraud/spark
+        export HADOOP_HOME=/home/fraud/hadoop-3.5.0
+        export PATH=$HADOOP_HOME/bin:$SPARK_HOME/bin:$PATH
+        export PYSPARK_PYTHON=/usr/bin/python3
+        export PYSPARK_DRIVER_PYTHON=/usr/bin/python3
+
+        $SPARK_HOME/bin/spark-submit \
+            --packages io.delta:delta-spark_2.12:3.1.0 \
+            --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+            --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
+            --master local[2] \
+            /home/fraud/fraud_detection/spark_jobs/maintenance/sync_feedback_to_delta.py
+        """
+    )
+
     check_label_threshold = BranchPythonOperator(
         task_id="check_label_threshold",
         python_callable=check_label_count_gate
@@ -77,47 +91,42 @@ with DAG(
         bash_command="echo 'INFO: Insufficient auditor labels (< 500). Skipping model retraining.'"
     )
 
-    # 2. Xay dung tap dac trung Point-in-Time chong ro ri du lieu
     build_pit_features = BashOperator(
         task_id="build_pit_features",
         bash_command="""
-        export SPARK_HOME=/home/master/spark
-        export HADOOP_HOME=/home/master/hadoop-3.5.0
+        export SPARK_HOME=/home/fraud/spark
+        export HADOOP_HOME=/home/fraud/hadoop-3.5.0
         export PATH=$HADOOP_HOME/bin:$SPARK_HOME/bin:$PATH
         export PYSPARK_PYTHON=/usr/bin/python3
         export PYSPARK_DRIVER_PYTHON=/usr/bin/python3
-        export PYTHONPATH=/home/master/spark/python:/home/master/spark/python/lib/py4j-0.10.9.7-src.zip:$PYTHONPATH
+        export PYTHONPATH=/home/fraud/spark/python:/home/fraud/spark/python/lib/py4j-0.10.9.7-src.zip:$PYTHONPATH
 
-        $SPARK_HOME/bin/spark-submit --conf spark.cores.max=4 /home/master/fraud_detection/spark_jobs/ml/build_training_set.py
+        $SPARK_HOME/bin/spark-submit --conf spark.cores.max=4 /home/fraud/fraud_detection/spark_jobs/ml/build_training_set.py
         """
     )
 
-    # 3. Huan luyen va so sanh cac mo hinh hoc may
     train_and_evaluate_models = BashOperator(
         task_id="train_and_evaluate_models",
         bash_command="""
-        export SPARK_HOME=/home/master/spark
-        export HADOOP_HOME=/home/master/hadoop-3.5.0
+        export SPARK_HOME=/home/fraud/spark
+        export HADOOP_HOME=/home/fraud/hadoop-3.5.0
         export PATH=$HADOOP_HOME/bin:$SPARK_HOME/bin:$PATH
         export PYSPARK_PYTHON=/usr/bin/python3
         export PYSPARK_DRIVER_PYTHON=/usr/bin/python3
-        export PYTHONPATH=/home/master/spark/python:/home/master/spark/python/lib/py4j-0.10.9.7-src.zip:$PYTHONPATH
+        export PYTHONPATH=/home/fraud/spark/python:/home/fraud/spark/python/lib/py4j-0.10.9.7-src.zip:$PYTHONPATH
 
-        $SPARK_HOME/bin/spark-submit --conf spark.cores.max=4 /home/master/fraud_detection/spark_jobs/ml/train_model.py
+        $SPARK_HOME/bin/spark-submit --conf spark.cores.max=16 /home/fraud/fraud_detection/spark_jobs/ml/train_model.py
         """
     )
 
-    # 4. Phan nhanh danh gia hieu nang mo hinh
     compare_precision = BranchPythonOperator(
         task_id="compare_precision",
         python_callable=compare_model_precision
     )
-
-    # Nhanh A: Mo hinh moi vuot troi -> Dang ky va nap lai Streaming Job
     register_new_model = BashOperator(
         task_id="register_new_model",
         bash_command="""
-        export HADOOP_HOME=/home/master/hadoop-3.5.0
+        export HADOOP_HOME=/home/fraud/hadoop-3.5.0
         export PATH=$HADOOP_HOME/bin:$PATH
 
         echo 'SUCCESS: New model Precision@200 is superior to baseline.'
@@ -131,23 +140,22 @@ with DAG(
     reload_streaming_detector = BashOperator(
         task_id="reload_streaming_detector",
         bash_command="""
-        export SPARK_HOME=/home/master/spark
-        export HADOOP_HOME=/home/master/hadoop-3.5.0
+        export SPARK_HOME=/home/fraud/spark
+        export HADOOP_HOME=/home/fraud/hadoop-3.5.0
         export PATH=$HADOOP_HOME/bin:$SPARK_HOME/bin:$PATH
         export PYSPARK_PYTHON=/usr/bin/python3
         export PYSPARK_DRIVER_PYTHON=/usr/bin/python3
-        export PYTHONPATH=/home/master/spark/python:/home/master/spark/python/lib/py4j-0.10.9.7-src.zip:$PYTHONPATH
+        export PYTHONPATH=/home/fraud/spark/python:/home/fraud/spark/python/lib/py4j-0.10.9.7-src.zip:$PYTHONPATH
 
         echo 'Reloading Streaming Detector with newly registered model...'
         pkill -9 -f "FraudDetection_Realtime_Detector" || true
         sleep 2
-        nohup $SPARK_HOME/bin/spark-submit --conf spark.cores.max=4 /home/master/fraud_detection/spark_jobs/streaming/fraud_detector.py > /tmp/streaming_detector.log 2>&1 &
+        nohup $SPARK_HOME/bin/spark-submit --conf spark.cores.max=4 /home/fraud/fraud_detection/spark_jobs/streaming/fraud_detector.py > /tmp/streaming_detector.log 2>&1 &
         disown
         echo 'Streaming Detector successfully reloaded with updated model!'
         """
     )
 
-    # Nhanh B: Mo hinh moi kem hon -> Giu nguyen mo hinh cu va bao cao
     keep_current_model = BashOperator(
         task_id="keep_current_model",
         bash_command="echo 'WARN: New model Precision@200 did not exceed baseline. Retaining existing model.'"
@@ -158,8 +166,26 @@ with DAG(
         bash_command="echo 'Performance comparison report logged to gold.model_performance_comparison.'"
     )
 
-    # Thiet lap luong phu thuoc giua cac task
-    check_label_threshold >> [skip_insufficient_labels, build_pit_features]
+    sync_model_performance = BashOperator(
+        task_id="sync_model_performance",
+        trigger_rule="all_done",
+        bash_command="""
+        export SPARK_HOME=/home/fraud/spark
+        export HADOOP_HOME=/home/fraud/hadoop-3.5.0
+        export PATH=$HADOOP_HOME/bin:$SPARK_HOME/bin:$PATH
+        export PYSPARK_PYTHON=/usr/bin/python3
+        export PYSPARK_DRIVER_PYTHON=/usr/bin/python3
+
+        $SPARK_HOME/bin/spark-submit \
+            --packages io.delta:delta-spark_2.12:3.1.0 \
+            --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+            --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
+            --master local[2] \
+            /home/fraud/fraud_detection/spark_jobs/maintenance/sync_model_performance_to_cockroach.py
+        """
+    )
+
+    sync_feedback_to_delta >> check_label_threshold >> [skip_insufficient_labels, build_pit_features]
     build_pit_features >> train_and_evaluate_models >> compare_precision
-    compare_precision >> register_new_model >> reload_streaming_detector
-    compare_precision >> keep_current_model >> generate_performance_report
+    compare_precision >> register_new_model >> reload_streaming_detector >> sync_model_performance
+    compare_precision >> keep_current_model >> generate_performance_report >> sync_model_performance

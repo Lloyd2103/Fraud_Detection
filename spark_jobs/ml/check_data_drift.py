@@ -1,12 +1,26 @@
+import os
 import sys
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+for env_p in ["/home/fraud/fraud_detection/.env", ".env"]:
+    if os.path.exists(env_p):
+        load_dotenv(env_p)
+        break
+
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, when, lit, to_timestamp
+from pyspark.sql.functions import col, when, lit, to_timestamp, max as spark_max
 from delta.tables import DeltaTable
 
-FEATURES = "hdfs:///lakehouse/fraud_detection/features"
-DRIFT_GOLD    = "hdfs:///lakehouse/fraud_detection/gold/drift_monitoring"
-STATUS_PATH   = "hdfs:///lakehouse/fraud_detection/models/_drift_status"
+def clean_path(p):
+    if p and p.startswith("hdfs:///"):
+        return "/" + p[len("hdfs:///"):].lstrip("/")
+    return p
+
+FEATURES    = clean_path(os.getenv("FEATURES", "/lakehouse/fraud_detection/features"))
+DRIFT_GOLD  = clean_path(os.getenv("DRIFT_GOLD", "/lakehouse/fraud_detection/gold/drift_monitoring"))
+STATUS_PATH = clean_path(os.getenv("DRIFT_STATUS_PATH", "/lakehouse/fraud_detection/gold/drift_status"))
+
 
 spark = SparkSession.builder \
     .appName("FraudDetection_PSI_KS_Drift_Monitoring") \
@@ -18,14 +32,15 @@ spark.sparkContext.setLogLevel("WARN")
 
 NUM_BINS = 10
 
+# 18 actual numeric features in Point-in-Time Feature Store (DeTai2.pdf Section 2.5 & 2.6)
 FEATURES_TO_CHECK = [
-    "amount", "old_balance_source", "new_balance_source",
-    "old_balance_dest", "new_balance_dest",
-    "trans_count_total", "sum_amount_prev", "amount_to_avg_ratio",
-    "trans_count_24h", "sum_amount_24h", "trans_count_1h",
-    "error_balance_source", "error_balance_dest",
+    "amount", "log_amount", "old_balance_source", "old_balance_dest",
+    "balance_drain_ratio", "remaining_balance_ratio", "dest_to_source_bal_ratio",
+    "trans_count_1h", "trans_count_7d", "avg_amount_30d",
+    "amount_to_avg_ratio", "amount_to_sum_7d_ratio", "amount_zscore_local",
+    "amount_diff_avg_30d", "seconds_since_last_transaction",
+    "inbound_count_7d", "inbound_amount_7d", "amount_ratio_to_prev"
 ]
-
 
 MIN_BASELINE_ROWS = 1000
 MIN_TARGET_ROWS   = 100
@@ -51,6 +66,18 @@ def compute_ks_from_counts(base_counts, target_counts, n_base, n_target):
             max_ks = ks
     return max_ks
 
+
+def calculate_psi_and_ks(base_data, target_data, num_buckets=10):
+    import numpy as np
+    quantiles = np.percentile(base_data, np.linspace(0, 100, num_buckets + 1))
+    quantiles = sorted(list(set(quantiles)))
+    if len(quantiles) < 2:
+        return 0.0, 0.0
+    base_counts = np.histogram(base_data, bins=quantiles)[0].tolist()
+    target_counts = np.histogram(target_data, bins=quantiles)[0].tolist()
+    psi = compute_psi(base_counts, target_counts, len(base_data), len(target_data))
+    ks = compute_ks_from_counts(base_counts, target_counts, len(base_data), len(target_data))
+    return psi, ks
 
 def bucketize(df, feature, quantiles):
     expr = when(col(feature).isNull(), lit(-1))
@@ -108,16 +135,29 @@ def main():
 
     all_features = spark.read.format("delta").load(FEATURES)
 
-    seven_days_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-    print(f"Baseline: partition_date < {seven_days_ago}")
-    print(f"Target  : partition_date >= {seven_days_ago}")
+    # Dynamic target window based on max partition_date in feature dataset
+    max_date_row = all_features.select(spark_max("partition_date")).collect()[0]
+    max_date_val = max_date_row[0]
+    if max_date_val is None:
+        max_date = datetime.now().date()
+    elif isinstance(max_date_val, str):
+        max_date = datetime.strptime(max_date_val, "%Y-%m-%d").date()
+    else:
+        max_date = max_date_val
 
-    baseline_df = all_features.filter(col("partition_date") < seven_days_ago)
-    target_df   = all_features.filter(col("partition_date") >= seven_days_ago)
+    cutoff_date = (max_date - timedelta(days=7)).strftime("%Y-%m-%d")
+    max_date_formatted = max_date.strftime("%Y-%m-%d")
+
+    print(f"Dataset Latest Partition Date : {max_date_formatted}")
+    print(f"Baseline Window (Historical)  : partition_date < {cutoff_date}")
+    print(f"Target Window (Recent 7-Day)  : partition_date >= {cutoff_date} AND partition_date <= {max_date_formatted}")
+
+    baseline_df = all_features.filter(col("partition_date") < cutoff_date)
+    target_df   = all_features.filter((col("partition_date") >= cutoff_date) & (col("partition_date") <= max_date_formatted))
 
     n_base = baseline_df.count()
     n_target = target_df.count()
-    print(f"Baseline rows: {n_base} | Target rows: {n_target}")
+    print(f"Baseline rows: {n_base:,} | Target rows: {n_target:,}")
 
     if n_base < MIN_BASELINE_ROWS or n_target < MIN_TARGET_ROWS:
         msg = f"Insufficient data (baseline={n_base}, target={n_target}). Skipping drift."
@@ -129,30 +169,52 @@ def main():
     baseline_df.cache()
     target_df.cache()
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = max_date_formatted
     results = []
     max_psi = 0.0
     skipped = []
 
+    valid_features = [f for f in FEATURES_TO_CHECK if f in baseline_df.columns and f in target_df.columns]
     for f in FEATURES_TO_CHECK:
-        if f not in baseline_df.columns or f not in target_df.columns:
+        if f not in valid_features:
             skipped.append(f)
             print(f"SKIP {f}: không có trong features schema")
-            continue
 
-        base_clean = baseline_df.select(f).dropna()
-        target_clean = target_df.select(f).dropna()
+    # High-performance representative sampling for vectorized PSI & KS calculation
+    sample_size = 50000
+    base_frac = min(1.0, float(sample_size) / float(n_base))
+    target_frac = min(1.0, float(sample_size) / float(n_target))
 
-        result = compute_drift_for_feature(base_clean, target_clean, f)
-        if result is None:
+    print(f"\nSampling {base_frac*100:.1f}% baseline and {target_frac*100:.1f}% target data for vectorized drift evaluation...")
+    base_pdf = baseline_df.select(valid_features).sample(fraction=base_frac, seed=42).toPandas()
+    targ_pdf = target_df.select(valid_features).sample(fraction=target_frac, seed=42).toPandas()
+    print(f"Loaded into memory: {len(base_pdf):,} baseline rows, {len(targ_pdf):,} target rows.\n")
+
+    print("-" * 65)
+    print(f"{'Feature':<30} | {'PSI':<7} | {'KS':<7} | {'Drift Level'}")
+    print("-" * 65)
+
+    for f in valid_features:
+        base_clean = base_pdf[f].dropna().values
+        target_clean = targ_pdf[f].dropna().values
+
+        if len(base_clean) < MIN_TARGET_ROWS or len(target_clean) < MIN_TARGET_ROWS:
             skipped.append(f)
-            print(f"SKIP {f}: không đủ dữ liệu để tính quantile")
+            print(f"SKIP {f}: không đủ dữ liệu")
             continue
 
-        feature, psi, ks, level = result
+        psi, ks = calculate_psi_and_ks(base_clean, target_clean, num_buckets=NUM_BINS)
+
+        if psi < 0.1:
+            level = "stable"
+        elif psi <= 0.25:
+            level = "warning"
+        else:
+            level = "critical"
+
         max_psi = max(max_psi, psi)
-        results.append((today_str, feature, psi, ks, level))
-        print(f"{feature:<25} | PSI: {psi:.4f} | KS: {ks:.4f} | {level}")
+        results.append((today_str, f, float(psi), float(ks), level))
+        print(f"{f:<30} | {psi:<7.4f} | {ks:<7.4f} | {level}")
 
     if not results:
         msg = f"No features computed. Skipped: {skipped}"

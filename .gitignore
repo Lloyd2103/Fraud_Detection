@@ -13,8 +13,6 @@ ENV/
 **/venv/
 **/env/
 webapp/backend/venv/
-webapp/
-
 # Node / Frontend Dependencies & Build
 node_modules/
 **/node_modules/

@@ -21,8 +21,8 @@ with DAG(
     optimize_and_vacuum_tables = BashOperator(
         task_id="optimize_and_vacuum_tables",
         bash_command="""
-        export SPARK_HOME=/home/master/spark
-        $SPARK_HOME/bin/spark-submit --conf spark.cores.max=4 /home/master/fraud_detection/spark_jobs/maintenance/optimize_vacuum.py
+        export SPARK_HOME=/home/fraud/spark
+        $SPARK_HOME/bin/spark-submit --conf spark.cores.max=4 /home/fraud/fraud_detection/spark_jobs/maintenance/optimize_vacuum.py
         """
     )
 
