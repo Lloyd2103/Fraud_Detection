@@ -1,0 +1,19 @@
+[Unit]
+Description=Fraud Detection Backend (FastAPI / Gunicorn Multi-Worker)
+After=network.target
+
+[Service]
+Type=simple
+User=fraud
+Group=fraud
+WorkingDirectory=/home/fraud/fraud_detection/webapp/backend
+Environment=PYTHONPATH=/home/fraud/fraud_detection/webapp/backend
+EnvironmentFile=/home/fraud/fraud_detection/.env
+ExecStart=/home/fraud/fraud_detection/webapp/backend/venv/bin/gunicorn main:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 127.0.0.1:8000 --access-logfile - --error-logfile -
+Restart=always
+RestartSec=5s
+StandardOutput=append:/home/fraud/fraud_detection/webapp/backend/backend.log
+StandardError=append:/home/fraud/fraud_detection/webapp/backend/backend.log
+
+[Install]
+WantedBy=multi-user.target

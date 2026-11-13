@@ -1,0 +1,19 @@
+[Unit]
+Description=Fraud Sync Gold Delta -> CockroachDB (delta-rs daemon)
+After=network.target fraud-backend.service
+
+[Service]
+Type=simple
+User=fraud
+Group=fraud
+WorkingDirectory=/home/fraud/fraud_detection/webapp/backend
+Environment=PYTHONPATH=/home/fraud/fraud_detection/webapp/backend
+EnvironmentFile=/home/fraud/fraud_detection/.env
+ExecStart=/home/fraud/fraud_detection/webapp/backend/venv/bin/python -m app.jobs.sync_gold_serving_native --loop --interval 2
+Restart=always
+RestartSec=5s
+StandardOutput=append:/home/fraud/fraud_detection/webapp/backend/sync_gold.log
+StandardError=append:/home/fraud/fraud_detection/webapp/backend/sync_gold.log
+
+[Install]
+WantedBy=multi-user.target

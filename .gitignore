@@ -42,3 +42,10 @@ Thumbs.db
 
 README.md
 
+
+# Allow deploy configs
+!deploy/**/*.cfg
+
+# Rotated logs & archives
+*.log.*
+*.gz
